@@ -4,66 +4,76 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Private Notes</title>
+  <title>Private Message Encryptor</title>
   <style>
     :root { color-scheme: dark; font: 16px system-ui, sans-serif; }
-    body { max-width: 760px; margin: 0 auto; padding: 2rem 1rem; background: #111827; color: #f9fafb; }
+    body { max-width: 860px; margin: 0 auto; padding: 2rem 1rem; background: #111827; color: #f9fafb; }
     main { background: #1f2937; border-radius: 12px; padding: 1.25rem; }
     h1 { margin-top: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
     label { display: block; margin: .8rem 0 .35rem; font-weight: 600; }
     input, textarea, button { box-sizing: border-box; width: 100%; padding: .7rem; border-radius: 7px; border: 1px solid #4b5563; font: inherit; }
     input, textarea { background: #111827; color: inherit; }
-    textarea { min-height: 300px; resize: vertical; }
+    textarea { min-height: 180px; resize: vertical; }
     button { margin-top: 1rem; background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
     button.secondary { background: #374151; }
-    .hidden { display: none; }
     .status { min-height: 1.4em; margin-top: .8rem; color: #fbbf24; }
     .small { color: #9ca3af; font-size: .9rem; }
+    .card { border: 1px solid #374151; border-radius: 8px; padding: 1rem; }
   </style>
 </head>
 <body>
   <main>
-    <h1>Private Notes</h1>
-    <p class="small">Your password unlocks notes locally. It is never stored or sent anywhere.</p>
+    <h1>Private Message Encryptor</h1>
+    <p class="small">Encrypt messages in your browser, copy the result, and send it to a friend. Share the passphrase separately.</p>
 
-    <section id="login">
-      <label for="password">Access password</label>
-      <input id="password" type="password" autocomplete="current-password" required>
-      <button id="unlock">Unlock</button>
-    </section>
+    <label for="password">Shared passphrase</label>
+    <input id="password" type="password" autocomplete="off" placeholder="Use the same passphrase with your friend">
 
-    <section id="editor" class="hidden">
-      <label for="notes">Notes</label>
-      <textarea id="notes" spellcheck="false" autocomplete="off"></textarea>
-      <button id="save">Encrypt and save</button>
-      <button id="lock" class="secondary">Lock</button>
-    </section>
+    <div class="grid">
+      <section class="card">
+        <h2>Encrypt a message</h2>
+        <label for="plain">Message</label>
+        <textarea id="plain" autocomplete="off" placeholder="Type a private message"></textarea>
+        <button id="encrypt">Encrypt message</button>
+        <label for="encrypted">Encrypted message to copy</label>
+        <textarea id="encrypted" readonly spellcheck="false"></textarea>
+        <button id="copy" class="secondary">Copy encrypted message</button>
+      </section>
+
+      <section class="card">
+        <h2>Decrypt a message</h2>
+        <label for="incoming">Paste encrypted message</label>
+        <textarea id="incoming" spellcheck="false" autocomplete="off"></textarea>
+        <button id="decrypt">Decrypt message</button>
+        <label for="decrypted">Decrypted message</label>
+        <textarea id="decrypted" readonly></textarea>
+      </section>
+    </div>
     <div id="status" class="status" role="status" aria-live="polite"></div>
   </main>
 
   <script>
     'use strict';
-    const STORAGE_KEY = 'private-notes-v1';
     const ITERATIONS = 600000;
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     const $ = (id) => document.getElementById(id);
-    let password = '';
 
-    function bytesToBase64(bytes) {
+    function toBase64(bytes) {
       let binary = '';
       for (const byte of bytes) binary += String.fromCharCode(byte);
       return btoa(binary);
     }
 
-    function base64ToBytes(value) {
+    function fromBase64(value) {
       const binary = atob(value);
       return Uint8Array.from(binary, (char) => char.charCodeAt(0));
     }
 
-    async function deriveKey(secret, salt) {
+    async function deriveKey(passphrase, salt) {
       const material = await crypto.subtle.importKey(
-        'raw', encoder.encode(secret), 'PBKDF2', false, ['deriveKey']
+        'raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveKey']
       );
       return crypto.subtle.deriveKey(
         { name: 'PBKDF2', salt, iterations: ITERATIONS, hash: 'SHA-256' },
@@ -74,65 +84,72 @@
       );
     }
 
-    async function encrypt(text, secret) {
+    async function encryptMessage(message, passphrase) {
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const iv = crypto.getRandomValues(new Uint8Array(12));
-      const key = await deriveKey(secret, salt);
+      const key = await deriveKey(passphrase, salt);
       const ciphertext = await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv }, key, encoder.encode(text)
+        { name: 'AES-GCM', iv }, key, encoder.encode(message)
       );
       return JSON.stringify({
-        version: 1, iterations: ITERATIONS,
-        salt: bytesToBase64(salt), iv: bytesToBase64(iv),
-        ciphertext: bytesToBase64(new Uint8Array(ciphertext))
+        app: 'private-message',
+        version: 1,
+        iterations: ITERATIONS,
+        salt: toBase64(salt),
+        iv: toBase64(iv),
+        ciphertext: toBase64(new Uint8Array(ciphertext))
       });
     }
 
-    async function decrypt(record, secret) {
+    async function decryptMessage(record, passphrase) {
       const data = JSON.parse(record);
-      if (data.version !== 1 || data.iterations !== ITERATIONS) throw new Error('Unsupported encrypted data');
-      const key = await deriveKey(secret, base64ToBytes(data.salt));
+      if (data.app !== 'private-message' || data.version !== 1 || data.iterations !== ITERATIONS) {
+        throw new Error('Unsupported message format');
+      }
+      const key = await deriveKey(passphrase, fromBase64(data.salt));
       const plaintext = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: base64ToBytes(data.iv) },
-        key, base64ToBytes(data.ciphertext)
+        { name: 'AES-GCM', iv: fromBase64(data.iv) },
+        key,
+        fromBase64(data.ciphertext)
       );
       return decoder.decode(plaintext);
     }
 
-    function setStatus(message) { $('status').textContent = message; }
+    function status(message) { $('status').textContent = message; }
 
-    $('unlock').addEventListener('click', async () => {
-      const candidate = $('password').value;
-      if (!candidate) return setStatus('Enter a password.');
+    $('encrypt').addEventListener('click', async () => {
+      const passphrase = $('password').value;
+      const message = $('plain').value;
+      if (!passphrase || !message) return status('Enter a passphrase and message.');
       try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        const text = saved ? await decrypt(saved, candidate) : '';
-        password = candidate;
-        $('notes').value = text;
-        $('password').value = '';
-        $('login').classList.add('hidden');
-        $('editor').classList.remove('hidden');
-        setStatus(saved ? 'Unlocked.' : 'Create your first encrypted note.');
+        $('encrypted').value = await encryptMessage(message, passphrase);
+        status('Message encrypted. Copy the encrypted text and send it to your friend.');
       } catch {
-        setStatus('Incorrect password or damaged encrypted data.');
+        status('Encryption failed.');
       }
     });
 
-    $('save').addEventListener('click', async () => {
+    $('copy').addEventListener('click', async () => {
+      if (!$('encrypted').value) return status('Encrypt a message first.');
       try {
-        localStorage.setItem(STORAGE_KEY, await encrypt($('notes').value, password));
-        setStatus('Encrypted and saved on this device.');
+        await navigator.clipboard.writeText($('encrypted').value);
+        status('Encrypted message copied.');
       } catch {
-        setStatus('Could not save the encrypted note.');
+        $('encrypted').select();
+        status('Copy was blocked. Select and copy the encrypted text manually.');
       }
     });
 
-    $('lock').addEventListener('click', () => {
-      password = '';
-      $('notes').value = '';
-      $('editor').classList.add('hidden');
-      $('login').classList.remove('hidden');
-      setStatus('Locked.');
+    $('decrypt').addEventListener('click', async () => {
+      const passphrase = $('password').value;
+      const incoming = $('incoming').value.trim();
+      if (!passphrase || !incoming) return status('Enter a passphrase and encrypted message.');
+      try {
+        $('decrypted').value = await decryptMessage(incoming, passphrase);
+        status('Message decrypted.');
+      } catch {
+        status('Could not decrypt. Check the passphrase and complete encrypted message.');
+      }
     });
   </script>
 </body>
