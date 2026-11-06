@@ -17,6 +17,7 @@
     textarea { min-height: 180px; resize: vertical; }
     button { margin-top: 1rem; background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
     button.secondary { background: #374151; }
+    .hidden { display: none; }
     .status { min-height: 1.4em; margin-top: .8rem; color: #fbbf24; }
     .small { color: #9ca3af; font-size: .9rem; }
     .card { border: 1px solid #374151; border-radius: 8px; padding: 1rem; }
@@ -25,10 +26,15 @@
 <body>
   <main>
     <h1>Private Message Encryptor</h1>
-    <p class="small">Encrypt messages in your browser, copy the result, and send it to a friend. Share the passphrase separately.</p>
+    <section id="gate">
+      <p class="small">Enter the access code to open the message tools.</p>
+      <label for="accessCode">Access code</label>
+      <input id="accessCode" type="password" autocomplete="current-password">
+      <button id="unlock">Unlock</button>
+    </section>
 
-    <label for="password">Shared passphrase</label>
-    <input id="password" type="password" autocomplete="off" placeholder="Use the same passphrase with your friend">
+    <section id="app" class="hidden">
+    <p class="small">Use the access code with your friend. Messages are encrypted locally and never uploaded.</p>
 
     <div class="grid">
       <section class="card">
@@ -50,6 +56,8 @@
         <textarea id="decrypted" readonly></textarea>
       </section>
     </div>
+    <button id="lock" class="secondary">Lock</button>
+    </section>
     <div id="status" class="status" role="status" aria-live="polite"></div>
   </main>
 
@@ -59,6 +67,8 @@
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     const $ = (id) => document.getElementById(id);
+    const ACCESS_CODE = 'pepper';
+    let passphrase = '';
 
     function toBase64(bytes) {
       let binary = '';
@@ -117,8 +127,18 @@
 
     function status(message) { $('status').textContent = message; }
 
+    $('unlock').addEventListener('click', () => {
+      if ($('accessCode').value !== ACCESS_CODE) {
+        return status('Incorrect access code.');
+      }
+      passphrase = $('accessCode').value;
+      $('accessCode').value = '';
+      $('gate').classList.add('hidden');
+      $('app').classList.remove('hidden');
+      status('Unlocked.');
+    });
+
     $('encrypt').addEventListener('click', async () => {
-      const passphrase = $('password').value;
       const message = $('plain').value;
       if (!passphrase || !message) return status('Enter a passphrase and message.');
       try {
@@ -141,7 +161,6 @@
     });
 
     $('decrypt').addEventListener('click', async () => {
-      const passphrase = $('password').value;
       const incoming = $('incoming').value.trim();
       if (!passphrase || !incoming) return status('Enter a passphrase and encrypted message.');
       try {
@@ -150,6 +169,17 @@
       } catch {
         status('Could not decrypt. Check the passphrase and complete encrypted message.');
       }
+    });
+
+    $('lock').addEventListener('click', () => {
+      passphrase = '';
+      $('plain').value = '';
+      $('encrypted').value = '';
+      $('incoming').value = '';
+      $('decrypted').value = '';
+      $('app').classList.add('hidden');
+      $('gate').classList.remove('hidden');
+      status('Locked.');
     });
   </script>
 </body>
