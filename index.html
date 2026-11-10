@@ -18,6 +18,7 @@
     button { margin-top: 1rem; background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
     button.secondary { background: #374151; }
     .hidden { display: none; }
+    #accessGate { max-width: 420px; margin: 4rem auto; }
     nav { display: flex; gap: .5rem; margin-bottom: 1rem; }
     nav button { width: auto; margin: 0; }
     nav button.active { background: #16a34a; }
@@ -30,6 +31,15 @@
 </head>
 <body>
 <main>
+  <section id="accessGate">
+    <h1>Private Messages</h1>
+    <p class="small">Enter the access password to continue.</p>
+    <label for="accessPassword">Access password</label>
+    <input id="accessPassword" type="password" autocomplete="current-password">
+    <button id="unlock">Unlock</button>
+    <p id="accessStatus" class="status" role="status" aria-live="polite"></p>
+  </section>
+  <section id="protectedApp" class="hidden">
   <h1>Private Live Chat</h1>
   <p class="small">No account required. Messages are encrypted in your browser.</p>
   <nav>
@@ -106,11 +116,13 @@
     </div>
   </section>
   <p id="status" class="status" role="status" aria-live="polite"></p>
+  </section>
 </main>
 <script>
 'use strict';
 const SUPABASE_URL = 'https://iozdwksqfhlhcrbhrwfl.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM';
+const ACCESS_PASSWORD_HASH = '8cbbcf29d9cef89675c5f5c1dcfe827d0570416a5aaba30dd0de159661ad905b';
 const ITERATIONS = 600000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -122,6 +134,22 @@ let realtimeChannel = null;
 let anonymousUser = null;
 
 function status(message) { $('status').textContent = message; }
+async function sha256(value) {
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+$('unlock').addEventListener('click', async () => {
+  const candidate = $('accessPassword').value;
+  if (!candidate || await sha256(candidate) !== ACCESS_PASSWORD_HASH) {
+    $('accessPassword').value = '';
+    $('accessPassword').focus();
+    $('accessStatus').textContent = 'Incorrect access password.';
+    return;
+  }
+  $('accessGate').classList.add('hidden');
+  $('protectedApp').classList.remove('hidden');
+  $('accessPassword').value = '';
+});
 function randomCode() {
   const bytes = crypto.getRandomValues(new Uint8Array(6));
   return [...bytes].map((byte) => byte.toString(36).padStart(2, '0')).join('').slice(0, 10).toUpperCase();
