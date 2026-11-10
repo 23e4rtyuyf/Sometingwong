@@ -1,46 +1,46 @@
 # Private Live Chat
 
-Run this migration once in Supabase **SQL Editor**:
+The app uses the existing `messages` columns, so no `sender_name` column is
+needed. Run this in Supabase **SQL Editor**:
 
 ```sql
-alter table public.messages
-  add column if not exists room_code text,
-  add column if not exists sender_name text;
-
-alter table public.messages
-  alter column sender_id drop not null;
-
-alter table public.messages
-  alter column sender_email drop not null,
-  alter column receiver_email drop not null;
-
-update public.messages
-set room_code = 'LEGACY', sender_name = coalesce(sender_email, 'friend')
-where room_code is null;
-
-alter table public.messages
-  alter column room_code set not null,
-  alter column sender_name set not null;
+alter table public.messages enable row level security;
 
 drop policy if exists "send own messages" on public.messages;
 drop policy if exists "read sent or received messages" on public.messages;
 drop policy if exists "users can send messages" on public.messages;
 drop policy if exists "users can read their messages" on public.messages;
+drop policy if exists "anyone can send to a room" on public.messages;
+drop policy if exists "anyone can read a room" on public.messages;
 
-create policy "anyone can send to a room"
-on public.messages for insert to anon, authenticated
+create policy "chat can send encrypted messages"
+on public.messages for insert
+to anon, authenticated
 with check (
-  room_code ~ '^[A-Z0-9]{6,12}$'
-  and length(sender_name) between 1 and 40
+  length(sender_email) between 1 and 40
+  and receiver_email ~ '^[A-Z0-9]{6,12}$'
+  and length(encrypted_text) > 30
 );
 
-create policy "anyone can read a room"
-on public.messages for select to anon, authenticated
-using (room_code ~ '^[A-Z0-9]{6,12}$');
+create policy "chat can read encrypted messages"
+on public.messages for select
+to anon, authenticated
+using (receiver_email ~ '^[A-Z0-9]{6,12}$');
 
-alter publication supabase_realtime add table public.messages;
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'messages'
+  ) then
+    alter publication supabase_realtime add table public.messages;
+  end if;
+end $$;
 ```
 
-The app stores only `PM3` ciphertext. The room code is not encryption, so
-share a strong passphrase separately. Anyone who knows a room code can see
-that room's ciphertext, but cannot decrypt it without the passphrase.
+In this simple design, `sender_email` stores the nickname and `receiver_email`
+stores the room code. Only encrypted ciphertext is stored; the passphrase is
+never sent to Supabase. A strong passphrase protects message contents, but no
+public website can be guaranteed impossible to hack.
