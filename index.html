@@ -26,6 +26,7 @@
     .status { min-height: 1.4em; color: #fbbf24; }
     #messages { max-height: 460px; overflow-y: auto; }
     .message { border-top: 1px solid #374151; padding: .8rem 0; }
+    .message-body { margin: .5rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   </style>
 </head>
@@ -50,6 +51,7 @@
     <label for="passphrase">Encryption passphrase</label>
     <p class="small">Use this same passphrase for Live Chat and Classic Encryption.</p>
     <input id="passphrase" type="password" autocomplete="off">
+    <p class="small">Your name and last room are saved on this device. The passphrase is never saved.</p>
   </div>
 
   <section id="chatPage">
@@ -121,6 +123,7 @@ const SUPABASE_URL = 'https://iozdwksqfhlhcrbhrwfl.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM';
 const ACCESS_PASSWORD_HASH = '8cbbcf29d9cef89675c5f5c1dcfe827d0570416a5aaba30dd0de159661ad905b';
 const ITERATIONS = 600000;
+const PROFILE_KEY = 'private-chat-profile-v1';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -131,6 +134,21 @@ let realtimeChannel = null;
 let anonymousUser = null;
 
 function status(message) { $('status').textContent = message; }
+function loadProfile() {
+  try {
+    const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
+    if (typeof profile.name === 'string') {
+      $('createName').value = profile.name;
+      $('joinName').value = profile.name;
+    }
+    if (typeof profile.room === 'string') $('joinCode').value = profile.room;
+  } catch {
+    localStorage.removeItem(PROFILE_KEY);
+  }
+}
+function saveProfile() {
+  localStorage.setItem(PROFILE_KEY, JSON.stringify({ name: nickname, room: roomCode }));
+}
 async function sha256(value) {
   const digest = await crypto.subtle.digest('SHA-256', encoder.encode(value));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -211,13 +229,14 @@ async function loadMessages() {
     const row = document.createElement('div'); row.className = 'message';
     const meta = document.createElement('div'); meta.className = 'small';
     meta.textContent = `${item.sender_email} · ${new Date(item.created_at).toLocaleString()}`;
-    const output = document.createElement('pre'); output.textContent = '[Encrypted] Click decrypt.';
-    const decrypt = document.createElement('button'); decrypt.className = 'secondary'; decrypt.textContent = 'Decrypt';
-    decrypt.addEventListener('click', async () => {
-      try { output.textContent = await decryptMessage(item.encrypted_text, $('passphrase').value); }
-      catch { output.textContent = 'Wrong passphrase or damaged message.'; }
-    });
-    row.append(meta, output, decrypt); container.append(row);
+    const output = document.createElement('div');
+    output.className = 'message-body';
+    try {
+      output.textContent = await decryptMessage(item.encrypted_text, $('passphrase').value);
+    } catch {
+      output.textContent = 'Enter the correct encryption passphrase to view this message.';
+    }
+    row.append(meta, output); container.append(row);
   }
   container.lastElementChild?.scrollIntoView({ block: 'nearest' });
 }
@@ -232,6 +251,7 @@ async function enterRoom(code, name) {
   roomCode = code.toUpperCase().trim();
   nickname = name.trim();
   if (!/^[A-Z0-9]{6,12}$/.test(roomCode) || !nickname) { status('Enter a valid room code and name.'); return; }
+  saveProfile();
   $('roomCode').textContent = roomCode; $('identity').textContent = `You are ${nickname}`;
   $('rooms').classList.add('hidden'); $('chat').classList.remove('hidden');
   try {
@@ -299,6 +319,7 @@ $('classicDecrypt').addEventListener('click', async () => {
     status('Could not decrypt. Check the message and passphrase.');
   }
 });
+loadProfile();
 </script>
 </body>
 </html>
