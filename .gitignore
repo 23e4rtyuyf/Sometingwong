@@ -1,0 +1,4 @@
+# Keep local and Supabase Edge Function secrets out of GitHub.
+.env
+.env.*
+supabase/functions/.env

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Private Live Chat v2</title>
   <link rel="icon" href="attached_assets/generated_images/private-messages-mark.svg" type="image/svg+xml">
-  <script src="api-config.js?v=2"></script>
+  <script src="api-config.js?v=3"></script>
   <style>
     :root { color-scheme: light; font: 16px system-ui, sans-serif; }
     body { margin: 0; min-height: 100vh; background: #eef3fb; color: #172033; }
@@ -244,6 +244,7 @@ function lockForExpiredSession() {
 }
 async function apiRequest(path, options = {}, includeAuth = true) {
   const headers = new Headers(options.headers || {});
+  if (window.CHAT_API_KEY) headers.set('apikey', window.CHAT_API_KEY);
   if (includeAuth && apiToken) headers.set('Authorization', `Bearer ${apiToken}`);
   if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   let response;
