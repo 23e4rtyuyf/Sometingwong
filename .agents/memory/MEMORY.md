@@ -1,0 +1,1 @@
+- [GitHub Pages hosting](github-pages-hosting.md) — Keep the chat frontend static and host its Python API separately.
