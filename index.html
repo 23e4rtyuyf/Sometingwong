@@ -33,6 +33,7 @@
     .message-meta { font-size: .75rem; color: #b7c3d6; }
     .message-body { margin-top: .3rem; line-height: 1.4; }
     .empty-chat { padding: 4rem 1rem; text-align: center; color: #94a3b8; }
+    .profile-id { font-family: ui-monospace, monospace; color: #93c5fd; }
     .message-body { margin: .5rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   </style>
@@ -58,6 +59,14 @@
 
   <section id="chatPage">
   <section id="rooms" class="grid">
+    <div class="card">
+      <h2>Your profile</h2>
+      <p class="small">Signed in on this device</p>
+      <label for="profileName">Display name</label>
+      <input id="profileName" maxlength="40" autocomplete="nickname">
+      <p class="small">Profile ID: <span id="profileId" class="profile-id"></span></p>
+      <p class="small">Saved automatically on this device.</p>
+    </div>
     <div class="card">
       <h2>Create a room</h2>
       <label for="createName">Your name</label>
@@ -143,17 +152,26 @@ function status(message) { $('status').textContent = message; }
 function loadProfile() {
   try {
     const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
-    if (typeof profile.name === 'string') {
-      $('createName').value = profile.name;
-      $('joinName').value = profile.name;
-    }
+    if (!profile.id) profile.id = `user-${crypto.randomUUID().slice(0, 8)}`;
+    if (typeof profile.name !== 'string') profile.name = '';
+    $('profileName').value = profile.name;
+    $('createName').value = profile.name;
+    $('joinName').value = profile.name;
+    $('profileId').textContent = profile.id;
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
     if (typeof profile.room === 'string') $('joinCode').value = profile.room;
   } catch {
     localStorage.removeItem(PROFILE_KEY);
   }
 }
 function saveProfile() {
-  localStorage.setItem(PROFILE_KEY, JSON.stringify({ name: nickname, room: roomCode }));
+  const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
+  profile.id ||= `user-${crypto.randomUUID().slice(0, 8)}`;
+  profile.name = nickname;
+  profile.room = roomCode;
+  localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+  $('profileName').value = nickname;
+  $('profileId').textContent = profile.id;
 }
 async function sha256(value) {
   const digest = await crypto.subtle.digest('SHA-256', encoder.encode(value));
@@ -277,6 +295,19 @@ async function enterRoom(code, name) {
 }
 $('createRoom').addEventListener('click', () => enterRoom(randomCode(), $('createName').value));
 $('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('joinName').value));
+$('profileName').addEventListener('input', () => {
+  const name = $('profileName').value.trim();
+  if (!name) return;
+  const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
+  profile.id ||= `user-${crypto.randomUUID().slice(0, 8)}`;
+  profile.name = name;
+  localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+  $('createName').value = name;
+  $('joinName').value = name;
+  if (roomCode) nickname = name;
+  $('identity').textContent = roomCode ? `You are ${name}` : '';
+  $('profileId').textContent = profile.id;
+});
 $('send').addEventListener('click', async () => {
   const text = $('plain').value; const secret = encryptionSecret;
   if (!text) { status('Write a message first.'); return; }
