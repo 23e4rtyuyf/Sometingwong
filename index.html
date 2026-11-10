@@ -47,12 +47,7 @@
     <button id="chatTab" class="active">Live Chat</button>
     <button id="classicTab" class="secondary">Classic Encryption</button>
   </nav>
-  <div class="card">
-    <label for="passphrase">Encryption passphrase</label>
-    <p class="small">Use this same passphrase for Live Chat and Classic Encryption.</p>
-    <input id="passphrase" type="password" autocomplete="off">
-    <p class="small">Your name and last room are saved on this device. The passphrase is never saved.</p>
-  </div>
+  <p class="small">Your name and last room are saved on this device. Your password is never saved.</p>
 
   <section id="chatPage">
   <section id="rooms" class="grid">
@@ -132,6 +127,7 @@ let roomCode = '';
 let nickname = '';
 let realtimeChannel = null;
 let anonymousUser = null;
+let encryptionSecret = '';
 
 function status(message) { $('status').textContent = message; }
 function loadProfile() {
@@ -163,6 +159,7 @@ $('unlock').addEventListener('click', async () => {
   }
   $('accessGate').classList.add('hidden');
   $('protectedApp').classList.remove('hidden');
+  encryptionSecret = candidate;
   $('accessPassword').value = '';
 });
 function randomCode() {
@@ -232,7 +229,7 @@ async function loadMessages() {
     const output = document.createElement('div');
     output.className = 'message-body';
     try {
-      output.textContent = await decryptMessage(item.encrypted_text, $('passphrase').value);
+      output.textContent = await decryptMessage(item.encrypted_text, encryptionSecret);
     } catch {
       output.textContent = 'Enter the correct encryption passphrase to view this message.';
     }
@@ -265,8 +262,8 @@ async function enterRoom(code, name) {
 $('createRoom').addEventListener('click', () => enterRoom(randomCode(), $('createName').value));
 $('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('joinName').value));
 $('send').addEventListener('click', async () => {
-  const text = $('plain').value; const secret = $('passphrase').value;
-  if (!text || !secret) { status('Enter a message and passphrase.'); return; }
+  const text = $('plain').value; const secret = encryptionSecret;
+  if (!text || !secret) { status('Enter a message.'); return; }
   try {
     const { error } = await db.from('messages').insert({
       sender_id: anonymousUser.id,
@@ -291,8 +288,8 @@ $('chatTab').addEventListener('click', () => showPage('chat'));
 $('classicTab').addEventListener('click', () => showPage('classic'));
 $('classicEncrypt').addEventListener('click', async () => {
   const text = $('classicPlain').value;
-  const secret = $('passphrase').value;
-  if (!text || !secret) { status('Enter a message and passphrase.'); return; }
+  const secret = encryptionSecret;
+  if (!text || !secret) { status('Enter a message.'); return; }
   try {
     $('classicOutput').value = await encryptMessage(text, secret);
     status('Classic message encrypted.');
@@ -310,13 +307,13 @@ $('classicCopy').addEventListener('click', async () => {
 });
 $('classicDecrypt').addEventListener('click', async () => {
   const value = $('classicInput').value.trim();
-  const secret = $('passphrase').value;
-  if (!value || !secret) { status('Enter an encrypted message and passphrase.'); return; }
+  const secret = encryptionSecret;
+  if (!value || !secret) { status('Enter an encrypted message.'); return; }
   try {
     $('classicDecrypted').value = await decryptMessage(value, secret);
     status('Classic message decrypted.');
   } catch {
-    status('Could not decrypt. Check the message and passphrase.');
+    status('Could not decrypt. Check the message and password.');
   }
 });
 loadProfile();
