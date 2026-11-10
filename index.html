@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Private Messages</title>
+  <title>Private Live Chat</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     :root { color-scheme: dark; font: 16px system-ui, sans-serif; }
@@ -14,57 +14,53 @@
     label { display: block; margin: .8rem 0 .35rem; font-weight: 600; }
     input, textarea, button { box-sizing: border-box; width: 100%; padding: .7rem; border-radius: 7px; border: 1px solid #4b5563; font: inherit; }
     input, textarea { background: #111827; color: inherit; }
-    textarea { min-height: 130px; resize: vertical; }
+    textarea { min-height: 120px; resize: vertical; }
     button { margin-top: 1rem; background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
     button.secondary { background: #374151; }
     .hidden { display: none; }
     .small { color: #9ca3af; font-size: .9rem; }
     .status { min-height: 1.4em; color: #fbbf24; }
-    .message { border-top: 1px solid #374151; padding: .8rem 0; }
     #messages { max-height: 460px; overflow-y: auto; }
+    .message { border-top: 1px solid #374151; padding: .8rem 0; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   </style>
 </head>
 <body>
 <main>
-  <h1>Private Messages</h1>
-  <p class="small">Messages are encrypted in your browser before Supabase stores them.</p>
+  <h1>Private Live Chat</h1>
+  <p class="small">No account required. Messages are encrypted in your browser.</p>
 
-  <section id="auth">
-    <div class="grid">
-      <div class="card">
-        <h2>Sign in</h2>
-        <label for="email">Email</label>
-        <input id="email" type="email" autocomplete="email">
-        <label for="accountPassword">Account password</label>
-        <input id="accountPassword" type="password" autocomplete="current-password">
-        <button id="signIn">Sign in</button>
-        <button id="signUp" class="secondary">Create account</button>
-      </div>
-      <div class="card">
-        <h2>Encryption passphrase</h2>
-        <p class="small">Share this passphrase with your friend separately. It is never sent to Supabase.</p>
-        <label for="passphrase">Passphrase</label>
-        <input id="passphrase" type="password" autocomplete="off">
-      </div>
+  <section id="rooms" class="grid">
+    <div class="card">
+      <h2>Create a room</h2>
+      <label for="createName">Your name</label>
+      <input id="createName" maxlength="40" autocomplete="nickname">
+      <button id="createRoom">Create room</button>
+    </div>
+    <div class="card">
+      <h2>Join a room</h2>
+      <label for="joinCode">Room code</label>
+      <input id="joinCode" maxlength="12" autocomplete="off">
+      <label for="joinName">Your name</label>
+      <input id="joinName" maxlength="40" autocomplete="nickname">
+      <button id="joinRoom">Join room</button>
     </div>
   </section>
 
-  <section id="app" class="hidden">
-    <p id="account" class="small"></p>
+  <section id="chat" class="hidden">
+    <p class="small">Room code: <strong id="roomCode"></strong> — share it with your friend.</p>
     <div class="grid">
       <div class="card">
-        <h2>Send message</h2>
-        <label for="recipient">Friend's email</label>
-        <input id="recipient" type="email" autocomplete="off">
+        <label for="passphrase">Shared encryption passphrase</label>
+        <input id="passphrase" type="password" autocomplete="off">
         <label for="plain">Message</label>
         <textarea id="plain"></textarea>
         <button id="send">Encrypt and send</button>
       </div>
       <div class="card">
-        <h2>Controls</h2>
-        <button id="refresh" class="secondary">Refresh messages</button>
-        <button id="signOut" class="secondary">Sign out</button>
+        <p id="identity" class="small"></p>
+        <button id="refresh" class="secondary">Refresh</button>
+        <button id="leave" class="secondary">Leave room</button>
       </div>
     </div>
     <div class="card">
@@ -74,7 +70,6 @@
   </section>
   <p id="status" class="status" role="status" aria-live="polite"></p>
 </main>
-
 <script>
 'use strict';
 const SUPABASE_URL = 'https://iozdwksqfhlhcrbhrwfl.supabase.co';
@@ -84,10 +79,15 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const $ = (id) => document.getElementById(id);
-let currentUser = null;
+let roomCode = '';
+let nickname = '';
 let realtimeChannel = null;
 
 function status(message) { $('status').textContent = message; }
+function randomCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return [...bytes].map((byte) => byte.toString(36).padStart(2, '0')).join('').slice(0, 10).toUpperCase();
+}
 function b64(bytes) {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
@@ -100,10 +100,8 @@ function unb64(value) {
 }
 async function keyFor(secret, salt) {
   const material = await crypto.subtle.importKey('raw', encoder.encode(secret), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: ITERATIONS, hash: 'SHA-256' },
-    material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
-  );
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: ITERATIONS, hash: 'SHA-256' },
+    material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
 async function encryptMessage(text, secret) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -111,10 +109,7 @@ async function encryptMessage(text, secret) {
   const key = await keyFor(secret, salt);
   const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(text)));
   const packet = new Uint8Array(31 + cipher.length);
-  packet.set([80, 77, 3], 0);
-  packet.set(salt, 3);
-  packet.set(iv, 19);
-  packet.set(cipher, 31);
+  packet.set([80, 77, 3], 0); packet.set(salt, 3); packet.set(iv, 19); packet.set(cipher, 31);
   return `PM3.${b64(packet)}`;
 }
 async function decryptMessage(value, secret) {
@@ -125,111 +120,62 @@ async function decryptMessage(value, secret) {
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: packet.slice(19, 31) }, key, packet.slice(31));
   return decoder.decode(plain);
 }
-function setSignedIn(visible) {
-  $('auth').classList.toggle('hidden', visible);
-  $('app').classList.toggle('hidden', !visible);
-}
 async function loadMessages() {
-  const { data, error } = await db.from('messages')
-    .select('id, created_at, sender_email, receiver_email, encrypted_text')
-    .order('created_at', { ascending: true });
+  const { data, error } = await db.from('messages').select('id, created_at, sender_name, encrypted_text')
+    .eq('room_code', roomCode).order('created_at', { ascending: true });
   if (error) throw error;
   const container = $('messages');
   container.replaceChildren();
   if (!data.length) { container.textContent = 'No messages yet.'; return; }
   for (const item of data) {
-    const row = document.createElement('div');
-    row.className = 'message';
-    const meta = document.createElement('div');
-    meta.className = 'small';
-    meta.textContent = `${item.sender_email} → ${item.receiver_email} · ${new Date(item.created_at).toLocaleString()}`;
-    const output = document.createElement('pre');
-    output.textContent = '[Encrypted] Click decrypt.';
-    const decrypt = document.createElement('button');
-    decrypt.className = 'secondary';
-    decrypt.textContent = 'Decrypt';
+    const row = document.createElement('div'); row.className = 'message';
+    const meta = document.createElement('div'); meta.className = 'small';
+    meta.textContent = `${item.sender_name} · ${new Date(item.created_at).toLocaleString()}`;
+    const output = document.createElement('pre'); output.textContent = '[Encrypted] Click decrypt.';
+    const decrypt = document.createElement('button'); decrypt.className = 'secondary'; decrypt.textContent = 'Decrypt';
     decrypt.addEventListener('click', async () => {
       try { output.textContent = await decryptMessage(item.encrypted_text, $('passphrase').value); }
       catch { output.textContent = 'Wrong passphrase or damaged message.'; }
     });
-    row.append(meta, output, decrypt);
-    container.append(row);
+    row.append(meta, output, decrypt); container.append(row);
   }
   container.lastElementChild?.scrollIntoView({ block: 'nearest' });
 }
-function subscribeToMessages() {
+function subscribe() {
   if (realtimeChannel) db.removeChannel(realtimeChannel);
-  realtimeChannel = db.channel(`messages-${currentUser.id}`)
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
-      const message = payload.new;
-      const email = currentUser.email.toLowerCase();
-      if (message.sender_id === currentUser.id || message.receiver_email.toLowerCase() === email) {
-        await loadMessages();
-        status('New encrypted message received.');
-      }
-    })
-    .subscribe((state) => {
-      if (state === 'SUBSCRIBED') status('Live chat connected.');
-      if (state === 'CHANNEL_ERROR' || state === 'TIMED_OUT') status('Live chat connection failed. Use Refresh.');
-    });
+  realtimeChannel = db.channel(`room-${roomCode}`)
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_code=eq.${roomCode}` },
+      async () => { await loadMessages(); status('New encrypted message received.'); })
+    .subscribe((state) => { if (state === 'SUBSCRIBED') status('Live chat connected.'); });
 }
-async function refreshSession() {
-  const { data } = await db.auth.getUser();
-  currentUser = data.user;
-  if (!currentUser) { setSignedIn(false); return; }
-  $('account').textContent = `Signed in as ${currentUser.email}`;
-  setSignedIn(true);
-  await loadMessages();
-  subscribeToMessages();
+async function enterRoom(code, name) {
+  roomCode = code.toUpperCase().trim();
+  nickname = name.trim();
+  if (!/^[A-Z0-9]{6,12}$/.test(roomCode) || !nickname) { status('Enter a valid room code and name.'); return; }
+  $('roomCode').textContent = roomCode; $('identity').textContent = `You are ${nickname}`;
+  $('rooms').classList.add('hidden'); $('chat').classList.remove('hidden');
+  try { await loadMessages(); subscribe(); } catch (error) { status(error.message); }
 }
-$('signIn').addEventListener('click', async () => {
-  const { error } = await db.auth.signInWithPassword({ email: $('email').value.trim(), password: $('accountPassword').value });
-  if (error) { status(error.message); return; }
-  status('Signed in.');
-  await refreshSession();
-});
-$('signUp').addEventListener('click', async () => {
-  const { data, error } = await db.auth.signUp({ email: $('email').value.trim(), password: $('accountPassword').value });
-  if (error) { status(error.message); return; }
-  status(data.session ? 'Account created and signed in.' : 'Account created. Check your email, then sign in.');
-  if (data.session) await refreshSession();
-});
+$('createRoom').addEventListener('click', () => enterRoom(randomCode(), $('createName').value));
+$('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('joinName').value));
 $('send').addEventListener('click', async () => {
-  const recipient = $('recipient').value.trim().toLowerCase();
-  const text = $('plain').value;
-  const secret = $('passphrase').value;
-  if (!recipient || !text || !secret) { status('Enter recipient, message, and passphrase.'); return; }
+  const text = $('plain').value; const secret = $('passphrase').value;
+  if (!text || !secret) { status('Enter a message and passphrase.'); return; }
   try {
-    const encrypted = await encryptMessage(text, secret);
-    const { error } = await db.from('messages').insert({
-      sender_id: currentUser.id, sender_email: currentUser.email,
-      receiver_email: recipient, encrypted_text: encrypted
-    });
-    $('plain').addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) $('send').click();
-    });
+    const { error } = await db.from('messages').insert({ room_code: roomCode, sender_name: nickname, encrypted_text: await encryptMessage(text, secret) });
     if (error) throw error;
-    $('plain').value = '';
-    status('Encrypted message sent.');
-    await loadMessages();
+    $('plain').value = ''; status('Encrypted message sent.'); await loadMessages();
   } catch (error) { status(error.message || 'Could not send message.'); }
 });
-$('refresh').addEventListener('click', async () => {
-  try { await loadMessages(); status('Messages refreshed.'); }
-  catch (error) { status(error.message); }
+$('plain').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) $('send').click();
 });
-$('signOut').addEventListener('click', async () => {
-  await db.auth.signOut();
-  if (realtimeChannel) {
-    await db.removeChannel(realtimeChannel);
-    realtimeChannel = null;
-  }
-  currentUser = null;
-  setSignedIn(false);
-  status('Signed out.');
+$('refresh').addEventListener('click', async () => { try { await loadMessages(); status('Refreshed.'); } catch (error) { status(error.message); } });
+$('leave').addEventListener('click', async () => {
+  if (realtimeChannel) await db.removeChannel(realtimeChannel);
+  realtimeChannel = null; roomCode = ''; nickname = ''; $('messages').replaceChildren();
+  $('chat').classList.add('hidden'); $('rooms').classList.remove('hidden'); status('Left room.');
 });
-db.auth.onAuthStateChange(() => { refreshSession().catch((error) => status(error.message)); });
-refreshSession().catch((error) => status(error.message));
 </script>
 </body>
 </html>
