@@ -18,6 +18,9 @@
     button { margin-top: 1rem; background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
     button.secondary { background: #374151; }
     .hidden { display: none; }
+    nav { display: flex; gap: .5rem; margin-bottom: 1rem; }
+    nav button { width: auto; margin: 0; }
+    nav button.active { background: #16a34a; }
     .small { color: #9ca3af; font-size: .9rem; }
     .status { min-height: 1.4em; color: #fbbf24; }
     #messages { max-height: 460px; overflow-y: auto; }
@@ -29,7 +32,12 @@
 <main>
   <h1>Private Live Chat</h1>
   <p class="small">No account required. Messages are encrypted in your browser.</p>
+  <nav>
+    <button id="chatTab" class="active">Live Chat</button>
+    <button id="classicTab" class="secondary">Classic Encryption</button>
+  </nav>
 
+  <section id="chatPage">
   <section id="rooms" class="grid">
     <div class="card">
       <h2>Create a room</h2>
@@ -44,6 +52,33 @@
       <label for="joinName">Your name</label>
       <input id="joinName" maxlength="40" autocomplete="nickname">
       <button id="joinRoom">Join room</button>
+    </div>
+  </section>
+  </section>
+
+  <section id="classicPage" class="hidden">
+    <div class="grid">
+      <div class="card">
+        <h2>Encrypt</h2>
+        <label for="classicPlain">Message</label>
+        <textarea id="classicPlain"></textarea>
+        <label for="classicPassphrase">Passphrase</label>
+        <input id="classicPassphrase" type="password" autocomplete="off">
+        <button id="classicEncrypt">Encrypt</button>
+        <label for="classicOutput">Encrypted message</label>
+        <textarea id="classicOutput" readonly spellcheck="false"></textarea>
+        <button id="classicCopy" class="secondary">Copy encrypted message</button>
+      </div>
+      <div class="card">
+        <h2>Decrypt</h2>
+        <label for="classicInput">Encrypted message</label>
+        <textarea id="classicInput" spellcheck="false"></textarea>
+        <label for="classicDecryptPassphrase">Passphrase</label>
+        <input id="classicDecryptPassphrase" type="password" autocomplete="off">
+        <button id="classicDecrypt">Decrypt</button>
+        <label for="classicDecrypted">Decrypted message</label>
+        <textarea id="classicDecrypted" readonly></textarea>
+      </div>
     </div>
   </section>
 
@@ -120,6 +155,13 @@ async function decryptMessage(value, secret) {
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: packet.slice(19, 31) }, key, packet.slice(31));
   return decoder.decode(plain);
 }
+function showPage(page) {
+  const chat = page === 'chat';
+  $('chatPage').classList.toggle('hidden', !chat);
+  $('classicPage').classList.toggle('hidden', chat);
+  $('chatTab').classList.toggle('active', chat);
+  $('classicTab').classList.toggle('active', !chat);
+}
 async function loadMessages() {
   const { data, error } = await db.from('messages').select('id, created_at, sender_email, encrypted_text')
     .eq('receiver_email', roomCode).order('created_at', { ascending: true });
@@ -179,6 +221,38 @@ $('leave').addEventListener('click', async () => {
   if (realtimeChannel) await db.removeChannel(realtimeChannel);
   realtimeChannel = null; roomCode = ''; nickname = ''; $('messages').replaceChildren();
   $('chat').classList.add('hidden'); $('rooms').classList.remove('hidden'); status('Left room.');
+});
+$('chatTab').addEventListener('click', () => showPage('chat'));
+$('classicTab').addEventListener('click', () => showPage('classic'));
+$('classicEncrypt').addEventListener('click', async () => {
+  const text = $('classicPlain').value;
+  const secret = $('classicPassphrase').value;
+  if (!text || !secret) { status('Enter a message and passphrase.'); return; }
+  try {
+    $('classicOutput').value = await encryptMessage(text, secret);
+    status('Classic message encrypted.');
+  } catch { status('Could not encrypt message.'); }
+});
+$('classicCopy').addEventListener('click', async () => {
+  if (!$('classicOutput').value) { status('Encrypt a message first.'); return; }
+  try {
+    await navigator.clipboard.writeText($('classicOutput').value);
+    status('Encrypted message copied.');
+  } catch {
+    $('classicOutput').select();
+    status('Copy was blocked. Copy the selected text manually.');
+  }
+});
+$('classicDecrypt').addEventListener('click', async () => {
+  const value = $('classicInput').value.trim();
+  const secret = $('classicDecryptPassphrase').value;
+  if (!value || !secret) { status('Enter an encrypted message and passphrase.'); return; }
+  try {
+    $('classicDecrypted').value = await decryptMessage(value, secret);
+    status('Classic message decrypted.');
+  } catch {
+    status('Could not decrypt. Check the message and passphrase.');
+  }
 });
 </script>
 </body>
