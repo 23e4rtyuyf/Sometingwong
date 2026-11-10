@@ -262,6 +262,8 @@ function showPage(page) {
   const chat = page === 'chat';
   $('chatPage').classList.toggle('hidden', !chat);
   $('classicPage').classList.toggle('hidden', chat);
+  $('chat').classList.toggle('hidden', !chat || !roomCode);
+  if (chat) $('rooms').classList.toggle('hidden', Boolean(roomCode));
   $('chatTab').classList.toggle('active', chat);
   $('classicTab').classList.toggle('active', !chat);
 }
