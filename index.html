@@ -67,7 +67,7 @@
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     const $ = (id) => document.getElementById(id);
-    const ACCESS_CODE = 'pepper';
+    const ACCESS_CODE_HASH = '8cbbcf29d9cef89675c5f5c1dcfe827d0570416a5aaba30dd0de159661ad905b';
     let passphrase = '';
 
     function toBase64(bytes) {
@@ -79,6 +79,15 @@
     function fromBase64(value) {
       const binary = atob(value);
       return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    }
+
+    function bytesToHex(bytes) {
+      return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function hashAccessCode(code) {
+      const digest = await crypto.subtle.digest('SHA-256', encoder.encode(code));
+      return bytesToHex(new Uint8Array(digest));
     }
 
     function toBase64Url(bytes) {
@@ -153,11 +162,12 @@
 
     function status(message) { $('status').textContent = message; }
 
-    $('unlock').addEventListener('click', () => {
-      if ($('accessCode').value !== ACCESS_CODE) {
+    $('unlock').addEventListener('click', async () => {
+      const candidate = $('accessCode').value;
+      if (!candidate || await hashAccessCode(candidate) !== ACCESS_CODE_HASH) {
         return status('Incorrect access code.');
       }
-      passphrase = $('accessCode').value;
+      passphrase = candidate;
       $('accessCode').value = '';
       $('gate').classList.add('hidden');
       $('app').classList.remove('hidden');
