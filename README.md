@@ -38,16 +38,18 @@ PBKDF2 work factor slows those guesses but does not replace a strong password.
 ## Lock down direct Supabase access
 
 The old setup allowed anonymous browser requests to read and write all rooms.
-After the server is configured and working, the following SQL closes that
-direct database path while allowing the server's service-role key to operate.
-This changes production database permissions. Review and explicitly approve
-before running it in the Supabase SQL Editor:
+The following approved SQL closes that direct database path while allowing
+the server's service-role key to operate:
 
 ```sql
 alter table public.messages enable row level security;
 revoke all privileges on table public.messages from anon, authenticated, public;
 grant select, insert on table public.messages to service_role;
 ```
+
+This SQL has been applied in Supabase. A zero-row permission check confirmed
+anonymous reads are denied and the service role can still read; no message
+contents or test rows were accessed.
 
 Do not restore public `anon` read/insert grants or policies for `messages`.
 Direct anonymous Auth signup remains enabled only because the server creates a

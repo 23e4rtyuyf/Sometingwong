@@ -24,9 +24,8 @@ short-lived and held only in browser memory; a reload or new tab requires
 signing in again. Message encryption stays in the browser, and the server
 stores/forwards ciphertext only.
 
-The existing broad anonymous `messages` access must be removed in Supabase
-before the server-only access design is complete. The SQL is documented in
-README.md and must not be applied to production without the user's approval.
+The approved Supabase permission lock-down in README.md has been applied.
+Anonymous `messages` reads are denied and the service role can still read.
 Anonymous Auth sign-ins must remain enabled for server-created guest users.
 
 Browser encryption, clipboard access, and secure random IDs require HTTPS.
