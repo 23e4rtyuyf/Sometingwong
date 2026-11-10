@@ -6,7 +6,7 @@
   <title>Private Live Chat v2</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
-    :root { color-scheme: dark; font: 16px system-ui, sans-serif; }
+    :root { color-scheme: light; font: 16px system-ui, sans-serif; }
     body { margin: 0; min-height: 100vh; background: #eef3fb; color: #172033; }
     main { min-height: 100vh; }
     h1 { margin: .25rem 0; }
@@ -26,8 +26,8 @@
     nav { display: flex; gap: .5rem; margin-bottom: 1rem; padding: .75rem 1rem; background: #fff; border-bottom: 1px solid #dce4f0; }
     nav button { width: auto; margin: 0; }
     nav button.active { background: #16a34a; }
-    .small { color: #9ca3af; font-size: .9rem; }
-    .status { min-height: 1.4em; color: #fbbf24; }
+    .small { color: #64748b; font-size: .9rem; }
+    .status { min-height: 1.4em; color: #92400e; }
     #chatPage { min-height: 0; }
     .chat-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); min-height: 78vh; background: #fff; }
     .chat-sidebar { border-right: 1px solid #dce4f0; padding: 1rem; background: #f5f8fd; }
@@ -55,6 +55,17 @@
     .profile-id { font-family: ui-monospace, monospace; color: #93c5fd; }
     .message-body { margin: .5rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .terms-content { max-height: 52vh; overflow-y: auto; margin: .75rem 0; font-size: .9rem; line-height: 1.5; }
+    .terms-content h2 { font-size: 1rem; margin: 1rem 0 .35rem; }
+    .terms-content p { margin: .4rem 0; }
+    .terms-ack { display: flex; align-items: flex-start; gap: .6rem; font-weight: 400; line-height: 1.4; }
+    .terms-ack input { width: auto; flex: 0 0 auto; margin-top: .2rem; }
+    dialog { width: min(420px, calc(100% - 2rem)); border: 1px solid #dce4f0; border-radius: 14px; padding: 1.25rem; color: #172033; background: #fff; box-shadow: 0 20px 60px #0f172a40; }
+    .terms-dialog { width: min(720px, calc(100% - 2rem)); max-height: calc(100% - 2rem); }
+    dialog::backdrop { background: #0f172a99; }
+    dialog h2 { margin: 0 0 .5rem; }
+    .dialog-actions { display: flex; gap: .65rem; }
+    .dialog-actions button { flex: 1; }
   </style>
 </head>
 <body>
@@ -63,11 +74,47 @@
     <img class="brand" src="logo.png" alt="Private Messages logo">
     <h1>Private Messages</h1>
     <p class="small">Enter the access password to continue.</p>
-    <label for="accessPassword">Access password</label>
-    <input id="accessPassword" type="password" autocomplete="current-password">
-    <button id="unlock">Unlock</button>
-    <p id="accessStatus" class="status" role="status" aria-live="polite"></p>
+    <button id="showTerms" class="secondary">Read Terms of Service</button>
+    <p id="termsAcceptanceStatus" class="small">Review and accept the Terms before continuing.</p>
+    <form id="accessForm">
+      <input type="text" name="username" autocomplete="username" hidden>
+      <label for="accessPassword">Access password</label>
+      <input id="accessPassword" type="password" autocomplete="current-password">
+      <button id="unlock" type="submit">Unlock</button>
+      <p id="accessStatus" class="status" role="status" aria-live="polite"></p>
+    </form>
   </section>
+  <dialog id="termsDialog" class="terms-dialog" aria-labelledby="termsDialogTitle">
+    <h2 id="termsDialogTitle">Terms of Service and school-use notice</h2>
+    <div class="terms-content">
+        <p><strong>School use:</strong> If you work at or attend a school and choose to use this platform, do so only where permitted by your school’s policies and applicable law. Do not use a school-managed device, account, or network for private communications unless you understand and accept its monitoring policies. A school or network operator may monitor, block, or record activity on its devices, accounts, or network. Encryption cannot prevent monitoring of a compromised or monitored device.</p>
+        <h2>1. Acceptance of terms</h2>
+        <p>By accessing or using the Private Messages application (the “Platform”), you agree to these Terms of Service. If you do not agree, do not use the Platform.</p>
+        <h2>2. Privacy and data security</h2>
+        <p>The Platform encrypts message contents on your device before they are sent to the database. The Platform does not authorize schools, school districts, administrators, or other third parties to intercept, view, decrypt, or monitor your messages. Attempts to bypass encryption or access an account without its owner’s consent are prohibited by these Terms.</p>
+        <p>Encryption is not a guarantee against monitoring or disclosure. The Platform cannot prevent monitoring of your device, browser, account, or network; protect a compromised device; or control what a school or network operator does. Room codes, nicknames, and message timing may be visible to the service. Do not use the Platform where it is prohibited or where you cannot use a trusted device and network.</p>
+        <p>Where practicable and permitted by law, the Platform may restrict access in response to misuse or attempts to compromise user privacy. The Platform cannot guarantee that it can identify or block every third party.</p>
+        <h2>3. Disclaimer of warranties</h2>
+        <p>The Platform is provided “AS IS” and “AS AVAILABLE,” without warranties of any kind, express or implied, including merchantability, fitness for a particular purpose, or non-infringement. The creators do not guarantee uninterrupted, secure, or error-free service.</p>
+        <h2>4. Limitation of liability</h2>
+        <p>To the maximum extent permitted by applicable law, the Platform and its creators, developers, and affiliates are not liable for direct, indirect, incidental, special, consequential, or exemplary damages arising from use of the Platform.</p>
+        <p>The creators are not responsible for school discipline or other consequences resulting from your use, or for school monitoring, blocking, or action involving school-owned devices, school-issued accounts, or school networks.</p>
+        <p>To the maximum extent permitted by applicable law, the creators’ aggregate liability for claims relating to these Terms or the Platform is limited to $0.00. Some laws do not allow certain warranty exclusions or liability limits, so those limits may not apply to you.</p>
+        <h2>5. Indemnification</h2>
+        <p>To the maximum extent permitted by applicable law, you agree to indemnify and hold harmless the Platform’s creators, developers, and affiliates from claims and expenses (including reasonable attorney’s fees) arising from your use of the Platform, your violation of these Terms, or your violation of third-party rights, school policies, or applicable law.</p>
+        <h2>6. Governing law</h2>
+        <p>These Terms are governed by the laws of the State of California, without regard to its conflict-of-law provisions, subject to any laws that cannot be excluded.</p>
+    </div>
+    <label class="terms-ack" for="acceptTerms">
+      <input id="acceptTerms" type="checkbox">
+      <span>I have read and agree to the Terms of Service. I understand school devices and networks may be monitored.</span>
+    </label>
+    <p id="termsStatus" class="status" role="status" aria-live="polite"></p>
+    <div class="dialog-actions">
+      <button id="closeTerms" class="secondary" type="button">Close</button>
+      <button id="agreeTerms" type="button">I Agree</button>
+    </div>
+  </dialog>
   <section id="protectedApp" class="hidden">
   <h1><img class="brand" src="logo.png" alt="" style="width: 180px; height: 70px; margin: 0; display: inline-block; vertical-align: middle;"> Private Chat</h1>
   <p class="small">Your messages are encrypted before they leave this device.</p>
@@ -177,6 +224,7 @@ let nickname = '';
 let realtimeChannel = null;
 let anonymousUser = null;
 let encryptionSecret = '';
+let termsAccepted = false;
 
 function status(message) { $('status').textContent = message; }
 function loadProfile() {
@@ -207,7 +255,28 @@ async function sha256(value) {
   const digest = await crypto.subtle.digest('SHA-256', encoder.encode(value));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
-$('unlock').addEventListener('click', async () => {
+$('showTerms').addEventListener('click', () => {
+  $('termsStatus').textContent = '';
+  $('termsDialog').showModal();
+});
+$('closeTerms').addEventListener('click', () => $('termsDialog').close());
+$('agreeTerms').addEventListener('click', () => {
+  if (!$('acceptTerms').checked) {
+    $('termsStatus').textContent = 'Check the box to accept the Terms of Service.';
+    $('acceptTerms').focus();
+    return;
+  }
+  termsAccepted = true;
+  $('termsDialog').close();
+  $('termsAcceptanceStatus').textContent = 'Terms accepted for this session.';
+});
+$('accessForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!termsAccepted) {
+    $('accessStatus').textContent = 'Read and accept the Terms of Service to continue.';
+    $('showTerms').focus();
+    return;
+  }
   const candidate = $('accessPassword').value;
   if (!candidate || await sha256(candidate) !== ACCESS_PASSWORD_HASH) {
     $('accessPassword').value = '';
@@ -215,13 +284,14 @@ $('unlock').addEventListener('click', async () => {
     $('accessStatus').textContent = 'Incorrect access password.';
     return;
   }
+  $('accessPassword').value = '';
+  $('accessStatus').textContent = '';
   $('accessGate').classList.add('hidden');
   $('protectedApp').classList.remove('hidden');
   encryptionSecret = candidate;
   showPage('chat');
   $('rooms').classList.remove('hidden');
   $('chat').classList.add('hidden');
-  $('accessPassword').value = '';
 });
 function randomCode() {
   return String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
