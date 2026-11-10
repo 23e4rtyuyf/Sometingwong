@@ -5,6 +5,7 @@ needed. Run this in Supabase **SQL Editor**:
 
 ```sql
 alter table public.messages enable row level security;
+alter table public.messages alter column sender_id drop not null;
 
 drop policy if exists "send own messages" on public.messages;
 drop policy if exists "read sent or received messages" on public.messages;
