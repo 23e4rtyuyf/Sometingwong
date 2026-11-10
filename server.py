@@ -10,6 +10,7 @@ PUBLIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/logo.png": ("logo.png", "image/png"),
+    "/logo.svg": ("attached_assets/generated_images/private-messages-mark.svg", "image/svg+xml"),
 }
 
 

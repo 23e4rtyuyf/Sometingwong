@@ -22,7 +22,8 @@
     button.secondary { background: #374151; }
     .hidden { display: none; }
     #accessGate { max-width: 420px; margin: 4rem auto; }
-    .brand { display: block; width: min(100%, 360px); max-height: 180px; object-fit: cover; margin: 0 auto 1rem; border-radius: 16px; }
+    .brand { display: block; width: 108px; height: 108px; object-fit: contain; margin: 0 auto 1rem; }
+    .header-brand { display: inline-block; width: 44px; height: 44px; object-fit: contain; margin: 0 .5rem 0 0; vertical-align: middle; }
     nav { display: flex; gap: .5rem; margin-bottom: 1rem; padding: .75rem 1rem; background: #fff; border-bottom: 1px solid #dce4f0; }
     nav button { width: auto; margin: 0; }
     nav button.active { background: #16a34a; }
@@ -71,7 +72,7 @@
 <body>
 <main>
   <section id="accessGate">
-    <img class="brand" src="logo.png" alt="Private Messages logo">
+    <img class="brand" src="/logo.svg" alt="Private Messages logo">
     <h1>Private Messages</h1>
     <p class="small">Enter the access password to continue.</p>
     <button id="showTerms" class="secondary">Read Terms of Service</button>
@@ -116,7 +117,7 @@
     </div>
   </dialog>
   <section id="protectedApp" class="hidden">
-  <h1><img class="brand" src="logo.png" alt="" style="width: 180px; height: 70px; margin: 0; display: inline-block; vertical-align: middle;"> Private Chat</h1>
+  <h1><img class="header-brand" src="/logo.svg" alt=""> Private Chat</h1>
   <p class="small">Your messages are encrypted before they leave this device.</p>
   <nav>
     <button id="chatTab" class="active">Live Chat</button>
