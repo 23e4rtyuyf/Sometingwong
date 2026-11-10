@@ -81,6 +81,19 @@
       return Uint8Array.from(binary, (char) => char.charCodeAt(0));
     }
 
+    function toBase64Url(bytes) {
+      return toBase64(bytes)
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/g, '');
+    }
+
+    function fromBase64Url(value) {
+      const padded = value.replace(/-/g, '+').replace(/_/g, '/')
+        + '='.repeat((4 - value.length % 4) % 4);
+      return fromBase64(padded);
+    }
+
     async function deriveKey(passphrase, salt) {
       const material = await crypto.subtle.importKey(
         'raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveKey']
@@ -101,17 +114,30 @@
       const ciphertext = await crypto.subtle.encrypt(
         { name: 'AES-GCM', iv }, key, encoder.encode(message)
       );
-      return JSON.stringify({
-        app: 'private-message',
-        version: 1,
-        iterations: ITERATIONS,
-        salt: toBase64(salt),
-        iv: toBase64(iv),
-        ciphertext: toBase64(new Uint8Array(ciphertext))
-      });
+      const encrypted = new Uint8Array(3 + salt.length + iv.length + ciphertext.byteLength);
+      encrypted.set([80, 77, 2], 0);
+      encrypted.set(salt, 3);
+      encrypted.set(iv, 3 + salt.length);
+      encrypted.set(new Uint8Array(ciphertext), 3 + salt.length + iv.length);
+      return `PM2.${toBase64Url(encrypted)}`;
     }
 
     async function decryptMessage(record, passphrase) {
+      if (record.startsWith('PM2.')) {
+        const encrypted = fromBase64Url(record.slice(4));
+        if (encrypted.length < 32 || encrypted[0] !== 80 || encrypted[1] !== 77 || encrypted[2] !== 2) {
+          throw new Error('Unsupported message format');
+        }
+        const salt = encrypted.slice(3, 19);
+        const iv = encrypted.slice(19, 31);
+        const ciphertext = encrypted.slice(31);
+        const key = await deriveKey(passphrase, salt);
+        const plaintext = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv }, key, ciphertext
+        );
+        return decoder.decode(plaintext);
+      }
+
       const data = JSON.parse(record);
       if (data.app !== 'private-message' || data.version !== 1 || data.iterations !== ITERATIONS) {
         throw new Error('Unsupported message format');
