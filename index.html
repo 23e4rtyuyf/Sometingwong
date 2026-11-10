@@ -93,8 +93,8 @@
     </div>
     <div class="card">
       <h2>Join a room</h2>
-      <label for="joinCode">Room code</label>
-      <input id="joinCode" maxlength="12" autocomplete="off">
+      <label for="joinCode">6-digit room code</label>
+      <input id="joinCode" inputmode="numeric" maxlength="6" pattern="[0-9]{6}" placeholder="123456" autocomplete="off">
       <label for="joinName">Your name</label>
       <input id="joinName" maxlength="40" autocomplete="nickname">
       <button id="joinRoom">Join room</button>
@@ -139,6 +139,7 @@
         <header class="chat-header">
           <span class="avatar" id="headerAvatar">P</span>
           <div><strong id="roomCode"></strong><p id="identity" class="small"></p></div>
+          <button id="copyRoomCode" class="secondary">Copy room code</button><p id="identity" class="small"></p></div>
         </header>
         <div class="chat-tools">
           <button id="refresh" class="secondary">Refresh</button>
@@ -215,8 +216,7 @@ $('unlock').addEventListener('click', async () => {
   $('accessPassword').value = '';
 });
 function randomCode() {
-  const bytes = crypto.getRandomValues(new Uint8Array(6));
-  return [...bytes].map((byte) => byte.toString(36).padStart(2, '0')).join('').slice(0, 10).toUpperCase();
+  return String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
 }
 function b64(bytes) {
   let binary = '';
@@ -305,7 +305,7 @@ function subscribe() {
 async function enterRoom(code, name) {
   roomCode = code.toUpperCase().trim();
   nickname = name.trim();
-  if (!/^[A-Z0-9]{6,12}$/.test(roomCode) || !nickname) { status('Enter a valid room code and name.'); return; }
+  if (!/^\d{6}$/.test(roomCode) || !nickname) { status('Enter a 6-digit room code and name.'); return; }
   saveProfile();
   $('roomCode').textContent = `Room ${roomCode}`;
   $('identity').textContent = `You are ${nickname}`;
@@ -323,6 +323,14 @@ async function enterRoom(code, name) {
 }
 $('createRoom').addEventListener('click', () => enterRoom(randomCode(), $('createName').value));
 $('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('joinName').value));
+$('copyRoomCode').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(roomCode);
+    status('Room code copied.');
+  } catch {
+    status(`Room code: ${roomCode}`);
+  }
+});
 $('profileName').addEventListener('input', () => {
   const name = $('profileName').value.trim();
   if (!name) return;
