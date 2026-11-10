@@ -121,8 +121,8 @@ async function decryptMessage(value, secret) {
   return decoder.decode(plain);
 }
 async function loadMessages() {
-  const { data, error } = await db.from('messages').select('id, created_at, sender_name, encrypted_text')
-    .eq('room_code', roomCode).order('created_at', { ascending: true });
+  const { data, error } = await db.from('messages').select('id, created_at, sender_email, encrypted_text')
+    .eq('receiver_email', roomCode).order('created_at', { ascending: true });
   if (error) throw error;
   const container = $('messages');
   container.replaceChildren();
@@ -130,7 +130,7 @@ async function loadMessages() {
   for (const item of data) {
     const row = document.createElement('div'); row.className = 'message';
     const meta = document.createElement('div'); meta.className = 'small';
-    meta.textContent = `${item.sender_name} · ${new Date(item.created_at).toLocaleString()}`;
+    meta.textContent = `${item.sender_email} · ${new Date(item.created_at).toLocaleString()}`;
     const output = document.createElement('pre'); output.textContent = '[Encrypted] Click decrypt.';
     const decrypt = document.createElement('button'); decrypt.className = 'secondary'; decrypt.textContent = 'Decrypt';
     decrypt.addEventListener('click', async () => {
@@ -144,7 +144,7 @@ async function loadMessages() {
 function subscribe() {
   if (realtimeChannel) db.removeChannel(realtimeChannel);
   realtimeChannel = db.channel(`room-${roomCode}`)
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_code=eq.${roomCode}` },
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `receiver_email=eq.${roomCode}` },
       async () => { await loadMessages(); status('New encrypted message received.'); })
     .subscribe((state) => { if (state === 'SUBSCRIBED') status('Live chat connected.'); });
 }
@@ -162,7 +162,11 @@ $('send').addEventListener('click', async () => {
   const text = $('plain').value; const secret = $('passphrase').value;
   if (!text || !secret) { status('Enter a message and passphrase.'); return; }
   try {
-    const { error } = await db.from('messages').insert({ room_code: roomCode, sender_name: nickname, encrypted_text: await encryptMessage(text, secret) });
+    const { error } = await db.from('messages').insert({
+      sender_email: nickname,
+      receiver_email: roomCode,
+      encrypted_text: await encryptMessage(text, secret)
+    });
     if (error) throw error;
     $('plain').value = ''; status('Encrypted message sent.'); await loadMessages();
   } catch (error) { status(error.message || 'Could not send message.'); }
