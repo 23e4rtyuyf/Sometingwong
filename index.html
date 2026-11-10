@@ -21,6 +21,7 @@
     .small { color: #9ca3af; font-size: .9rem; }
     .status { min-height: 1.4em; color: #fbbf24; }
     .message { border-top: 1px solid #374151; padding: .8rem 0; }
+    #messages { max-height: 460px; overflow-y: auto; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   </style>
 </head>
@@ -67,7 +68,7 @@
       </div>
     </div>
     <div class="card">
-      <h2>Your messages</h2>
+      <h2>Live chat</h2>
       <div id="messages"></div>
     </div>
   </section>
@@ -84,6 +85,7 @@ const decoder = new TextDecoder();
 const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const $ = (id) => document.getElementById(id);
 let currentUser = null;
+let realtimeChannel = null;
 
 function status(message) { $('status').textContent = message; }
 function b64(bytes) {
@@ -130,7 +132,7 @@ function setSignedIn(visible) {
 async function loadMessages() {
   const { data, error } = await db.from('messages')
     .select('id, created_at, sender_email, receiver_email, encrypted_text')
-    .order('created_at', { ascending: false });
+    .order('created_at', { ascending: true });
   if (error) throw error;
   const container = $('messages');
   container.replaceChildren();
@@ -153,6 +155,23 @@ async function loadMessages() {
     row.append(meta, output, decrypt);
     container.append(row);
   }
+  container.lastElementChild?.scrollIntoView({ block: 'nearest' });
+}
+function subscribeToMessages() {
+  if (realtimeChannel) db.removeChannel(realtimeChannel);
+  realtimeChannel = db.channel(`messages-${currentUser.id}`)
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
+      const message = payload.new;
+      const email = currentUser.email.toLowerCase();
+      if (message.sender_id === currentUser.id || message.receiver_email.toLowerCase() === email) {
+        await loadMessages();
+        status('New encrypted message received.');
+      }
+    })
+    .subscribe((state) => {
+      if (state === 'SUBSCRIBED') status('Live chat connected.');
+      if (state === 'CHANNEL_ERROR' || state === 'TIMED_OUT') status('Live chat connection failed. Use Refresh.');
+    });
 }
 async function refreshSession() {
   const { data } = await db.auth.getUser();
@@ -161,6 +180,7 @@ async function refreshSession() {
   $('account').textContent = `Signed in as ${currentUser.email}`;
   setSignedIn(true);
   await loadMessages();
+  subscribeToMessages();
 }
 $('signIn').addEventListener('click', async () => {
   const { error } = await db.auth.signInWithPassword({ email: $('email').value.trim(), password: $('accountPassword').value });
@@ -185,6 +205,9 @@ $('send').addEventListener('click', async () => {
       sender_id: currentUser.id, sender_email: currentUser.email,
       receiver_email: recipient, encrypted_text: encrypted
     });
+    $('plain').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) $('send').click();
+    });
     if (error) throw error;
     $('plain').value = '';
     status('Encrypted message sent.');
@@ -197,6 +220,10 @@ $('refresh').addEventListener('click', async () => {
 });
 $('signOut').addEventListener('click', async () => {
   await db.auth.signOut();
+  if (realtimeChannel) {
+    await db.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
   currentUser = null;
   setSignedIn(false);
   status('Signed out.');
