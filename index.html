@@ -28,7 +28,7 @@
     nav button.active { background: #16a34a; }
     .small { color: #9ca3af; font-size: .9rem; }
     .status { min-height: 1.4em; color: #fbbf24; }
-    #chatPage { min-height: 78vh; }
+    #chatPage { min-height: 0; }
     .chat-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); min-height: 78vh; background: #fff; }
     .chat-sidebar { border-right: 1px solid #dce4f0; padding: 1rem; background: #f5f8fd; }
     .chat-sidebar h1 { font-size: 1.4rem; }
@@ -260,10 +260,11 @@ async function decryptMessage(value, secret) {
 }
 function showPage(page) {
   const chat = page === 'chat';
-  $('chatPage').classList.toggle('hidden', !chat);
+  const inRoom = Boolean(roomCode);
+  $('chatPage').classList.toggle('hidden', !chat || inRoom);
   $('classicPage').classList.toggle('hidden', chat);
-  $('chat').classList.toggle('hidden', !chat || !roomCode);
-  if (chat) $('rooms').classList.toggle('hidden', Boolean(roomCode));
+  $('chat').classList.toggle('hidden', !chat || !inRoom);
+  $('rooms').classList.toggle('hidden', !chat || inRoom);
   $('chatTab').classList.toggle('active', chat);
   $('classicTab').classList.toggle('active', !chat);
 }
@@ -322,7 +323,7 @@ async function enterRoom(code, name) {
   $('sidebarName').textContent = nickname;
   $('sidebarAvatar').textContent = nickname.charAt(0).toUpperCase();
   $('headerAvatar').textContent = nickname.charAt(0).toUpperCase();
-  $('rooms').classList.add('hidden'); $('chat').classList.remove('hidden');
+  showPage('chat');
   try {
     await ensureAnonymousSession();
     await loadMessages();
@@ -378,7 +379,7 @@ $('refresh').addEventListener('click', async () => { try { await loadMessages();
 $('leave').addEventListener('click', async () => {
   if (realtimeChannel) await db.removeChannel(realtimeChannel);
   realtimeChannel = null; roomCode = ''; nickname = ''; $('messages').replaceChildren();
-  $('chat').classList.add('hidden'); $('rooms').classList.remove('hidden'); status('Left room.');
+  showPage('chat'); status('Left room.');
 });
 $('chatTab').addEventListener('click', () => showPage('chat'));
 $('classicTab').addEventListener('click', () => showPage('classic'));
