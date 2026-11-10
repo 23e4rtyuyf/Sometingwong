@@ -72,9 +72,6 @@
         <h2>Encrypt</h2>
         <label for="classicPlain">Message</label>
         <textarea id="classicPlain"></textarea>
-        <label for="classicPassphrase">Classic Encryption passphrase</label>
-        <p class="small">Keep this passphrase separate from Live Chat.</p>
-        <input id="classicPassphrase" type="password" autocomplete="off">
         <button id="classicEncrypt">Encrypt</button>
         <label for="classicOutput">Encrypted message</label>
         <textarea id="classicOutput" readonly spellcheck="false"></textarea>
@@ -84,8 +81,6 @@
         <h2>Decrypt</h2>
         <label for="classicInput">Encrypted message</label>
         <textarea id="classicInput" spellcheck="false"></textarea>
-        <label for="classicDecryptPassphrase">Classic Encryption passphrase</label>
-        <input id="classicDecryptPassphrase" type="password" autocomplete="off">
         <button id="classicDecrypt">Decrypt</button>
         <label for="classicDecrypted">Decrypted message</label>
         <textarea id="classicDecrypted" readonly></textarea>
@@ -97,8 +92,8 @@
     <p class="small">Room code: <strong id="roomCode"></strong> — share it with your friend.</p>
     <div class="grid">
       <div class="card">
-        <label for="passphrase">Live Chat passphrase</label>
-        <p class="small">Use a different passphrase from Classic Encryption.</p>
+        <label for="passphrase">Encryption passphrase</label>
+        <p class="small">This one passphrase is used for Live Chat and Classic Encryption.</p>
         <input id="passphrase" type="password" autocomplete="off">
         <label for="plain">Message</label>
         <textarea id="plain"></textarea>
@@ -274,7 +269,7 @@ $('chatTab').addEventListener('click', () => showPage('chat'));
 $('classicTab').addEventListener('click', () => showPage('classic'));
 $('classicEncrypt').addEventListener('click', async () => {
   const text = $('classicPlain').value;
-  const secret = $('classicPassphrase').value;
+  const secret = $('passphrase').value;
   if (!text || !secret) { status('Enter a message and passphrase.'); return; }
   try {
     $('classicOutput').value = await encryptMessage(text, secret);
@@ -293,7 +288,7 @@ $('classicCopy').addEventListener('click', async () => {
 });
 $('classicDecrypt').addEventListener('click', async () => {
   const value = $('classicInput').value.trim();
-  const secret = $('classicDecryptPassphrase').value;
+  const secret = $('passphrase').value;
   if (!value || !secret) { status('Enter an encrypted message and passphrase.'); return; }
   try {
     $('classicDecrypted').value = await decryptMessage(value, secret);
