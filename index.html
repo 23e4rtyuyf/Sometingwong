@@ -62,7 +62,8 @@
         <h2>Encrypt</h2>
         <label for="classicPlain">Message</label>
         <textarea id="classicPlain"></textarea>
-        <label for="classicPassphrase">Passphrase</label>
+        <label for="classicPassphrase">Classic Encryption passphrase</label>
+        <p class="small">Keep this passphrase separate from Live Chat.</p>
         <input id="classicPassphrase" type="password" autocomplete="off">
         <button id="classicEncrypt">Encrypt</button>
         <label for="classicOutput">Encrypted message</label>
@@ -73,7 +74,7 @@
         <h2>Decrypt</h2>
         <label for="classicInput">Encrypted message</label>
         <textarea id="classicInput" spellcheck="false"></textarea>
-        <label for="classicDecryptPassphrase">Passphrase</label>
+        <label for="classicDecryptPassphrase">Classic Encryption passphrase</label>
         <input id="classicDecryptPassphrase" type="password" autocomplete="off">
         <button id="classicDecrypt">Decrypt</button>
         <label for="classicDecrypted">Decrypted message</label>
@@ -86,7 +87,8 @@
     <p class="small">Room code: <strong id="roomCode"></strong> — share it with your friend.</p>
     <div class="grid">
       <div class="card">
-        <label for="passphrase">Shared encryption passphrase</label>
+        <label for="passphrase">Live Chat passphrase</label>
+        <p class="small">Use a different passphrase from Classic Encryption.</p>
         <input id="passphrase" type="password" autocomplete="off">
         <label for="plain">Message</label>
         <textarea id="plain"></textarea>
