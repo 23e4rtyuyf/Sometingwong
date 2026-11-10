@@ -4,7 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Private Live Chat v2</title>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <link rel="icon" href="attached_assets/generated_images/private-messages-mark.svg" type="image/svg+xml">
+  <script src="api-config.js"></script>
   <style>
     :root { color-scheme: light; font: 16px system-ui, sans-serif; }
     body { margin: 0; min-height: 100vh; background: #eef3fb; color: #172033; }
@@ -72,7 +73,7 @@
 <body>
 <main>
   <section id="accessGate">
-    <img class="brand" src="/logo.svg" alt="Private Messages logo">
+    <img class="brand" src="attached_assets/generated_images/private-messages-mark.svg" alt="Private Messages logo">
     <h1>Private Messages</h1>
     <p class="small">Enter the access password to continue.</p>
     <button id="showTerms" class="secondary">Read Terms of Service</button>
@@ -116,7 +117,7 @@
     </div>
   </dialog>
   <section id="protectedApp" class="hidden">
-  <h1><img class="header-brand" src="/logo.svg" alt=""> Private Chat</h1>
+  <h1><img class="header-brand" src="attached_assets/generated_images/private-messages-mark.svg" alt=""> Private Chat</h1>
   <p class="small">Your messages are encrypted before they leave this device.</p>
   <nav>
     <button id="chatTab" class="active">Live Chat</button>
@@ -210,28 +211,56 @@
 </main>
 <script>
 'use strict';
-const SUPABASE_URL = 'https://iozdwksqfhlhcrbhrwfl.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM';
-const ACCESS_PASSWORD_HASH = '8cbbcf29d9cef89675c5f5c1dcfe827d0570416a5aaba30dd0de159661ad905b';
-const ITERATIONS = 600000;
+const API_BASE_URL = (window.CHAT_API_BASE_URL || '').replace(/\/+$/, '');
+const AUTH_ITERATIONS = 600000;
+const AUTH_SALT = 'private-live-chat-auth-v1';
 const PROFILE_KEY = 'private-chat-profile-v1';
 const MESSAGE_CACHE_PREFIX = 'private-chat-encrypted-history-v1:';
 const MAX_CACHED_MESSAGES = 100;
 const MAX_CACHE_CHARS = 750000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const $ = (id) => document.getElementById(id);
 let roomCode = '';
 let nickname = '';
-let realtimeChannel = null;
-let anonymousUser = null;
+let pollTimer = null;
+let lastMessageSignature = null;
+let apiToken = '';
 let encryptionSecret = '';
 let termsAccepted = false;
 let savedProfile = {};
 let localHistorySaved = false;
 
 function status(message) { $('status').textContent = message; }
+function lockForExpiredSession() {
+  if (!apiToken) return;
+  apiToken = '';
+  encryptionSecret = '';
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+  $('accessGate').classList.remove('hidden');
+  $('protectedApp').classList.add('hidden');
+  $('accessStatus').textContent = 'Your session expired. Enter the access password again.';
+}
+async function apiRequest(path, options = {}, includeAuth = true) {
+  const headers = new Headers(options.headers || {});
+  if (includeAuth && apiToken) headers.set('Authorization', `Bearer ${apiToken}`);
+  if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...options, headers, credentials: 'omit', cache: 'no-store'
+    });
+  } catch {
+    throw new Error('Could not reach the chat server. Check the server URL and connection.');
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 401) lockForExpiredSession();
+    throw new Error(payload.error || 'The chat server could not complete the request.');
+  }
+  return payload;
+}
 function readCachedMessages(code) {
   try {
     const messages = JSON.parse(localStorage.getItem(`${MESSAGE_CACHE_PREFIX}${code}`) || '[]');
@@ -292,9 +321,14 @@ function saveProfile() {
   $('profileName').value = nickname;
   $('profileId').textContent = profile.id;
 }
-async function sha256(value) {
-  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(value));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+async function passwordProof(password, nonce) {
+  const material = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({
+    name: 'PBKDF2', salt: encoder.encode(AUTH_SALT), iterations: AUTH_ITERATIONS, hash: 'SHA-256'
+  }, material, 256);
+  const key = await crypto.subtle.importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, nonce));
+  return [...signature].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 $('showTerms').addEventListener('click', () => {
   $('termsStatus').textContent = '';
@@ -319,22 +353,36 @@ $('accessForm').addEventListener('submit', async (event) => {
     return;
   }
   const candidate = $('accessPassword').value;
-  if (!candidate || await sha256(candidate) !== ACCESS_PASSWORD_HASH) {
+  if (!candidate) {
     $('accessPassword').value = '';
     $('accessPassword').focus();
     $('accessStatus').textContent = 'Incorrect access password.';
     return;
   }
-  $('accessPassword').value = '';
-  $('accessStatus').textContent = '';
-  $('accessGate').classList.add('hidden');
-  $('protectedApp').classList.remove('hidden');
-  encryptionSecret = candidate;
-  showPage('chat');
-  $('rooms').classList.remove('hidden');
-  $('chat').classList.add('hidden');
-  if (savedProfile.room && savedProfile.name) {
-    await enterRoom(savedProfile.room, savedProfile.name);
+  $('accessStatus').textContent = 'Checking access…';
+  try {
+    const challenge = await apiRequest('/api/auth/challenge', { method: 'GET' }, false);
+    const proof = await passwordProof(candidate, unb64(challenge.nonce));
+    const session = await apiRequest('/api/auth/verify', {
+      method: 'POST',
+      body: JSON.stringify({ challengeId: challenge.challengeId, proof })
+    }, false);
+    apiToken = session.token;
+    encryptionSecret = candidate;
+    $('accessPassword').value = '';
+    $('accessStatus').textContent = '';
+    $('accessGate').classList.add('hidden');
+    $('protectedApp').classList.remove('hidden');
+    showPage('chat');
+    $('rooms').classList.remove('hidden');
+    $('chat').classList.add('hidden');
+    if (savedProfile.room && savedProfile.name) {
+      await enterRoom(savedProfile.room, savedProfile.name);
+    }
+  } catch (error) {
+    $('accessPassword').value = '';
+    $('accessPassword').focus();
+    $('accessStatus').textContent = error.message || 'Could not verify the access password.';
   }
 });
 function randomCode() {
@@ -352,7 +400,7 @@ function unb64(value) {
 }
 async function keyFor(secret, salt) {
   const material = await crypto.subtle.importKey('raw', encoder.encode(secret), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: ITERATIONS, hash: 'SHA-256' },
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: AUTH_ITERATIONS, hash: 'SHA-256' },
     material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
 async function encryptMessage(text, secret) {
@@ -382,16 +430,6 @@ function showPage(page) {
   $('chatTab').classList.toggle('active', chat);
   $('classicTab').classList.toggle('active', !chat);
 }
-async function ensureAnonymousSession() {
-  const { data: sessionData } = await db.auth.getSession();
-  if (sessionData.session?.user) {
-    anonymousUser = sessionData.session.user;
-    return;
-  }
-  const { data, error } = await db.auth.signInAnonymously();
-  if (error) throw new Error('Guest access is not enabled in Supabase yet.');
-  anonymousUser = data.user;
-}
 async function renderMessages(data) {
   const container = $('messages');
   container.replaceChildren();
@@ -418,31 +456,37 @@ async function renderMessages(data) {
   container.lastElementChild?.scrollIntoView({ block: 'nearest' });
 }
 async function loadMessages() {
-  const { data, error } = await db.from('messages').select('id, created_at, sender_email, encrypted_text')
-    .eq('receiver_email', roomCode).order('created_at', { ascending: true });
-  if (error) throw error;
-  localHistorySaved = cacheEncryptedMessages(roomCode, data);
-  await renderMessages(data);
+  const result = await apiRequest(`/api/messages?room=${encodeURIComponent(roomCode)}`);
+  const messages = result.messages;
+  const signature = messages.map((item) => item.id).join(',');
+  const hasNewMessages = lastMessageSignature !== null && signature !== lastMessageSignature;
+  if (signature === lastMessageSignature) return false;
+  lastMessageSignature = signature;
+  localHistorySaved = cacheEncryptedMessages(roomCode, messages);
+  await renderMessages(messages);
+  return hasNewMessages;
 }
 function subscribe() {
-  if (realtimeChannel) db.removeChannel(realtimeChannel);
-  realtimeChannel = db.channel(`room-${roomCode}`)
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `receiver_email=eq.${roomCode}` },
-      async () => { await loadMessages(); status('New message received.'); })
-    .subscribe((state) => {
-      if (state === 'SUBSCRIBED') {
-        status(localHistorySaved
-          ? 'Live chat connected. Recent encrypted messages are saved on this device.'
-          : 'Live chat connected. Local history could not be saved in this browser.');
-      }
-    });
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    if (!roomCode || !apiToken) return;
+    try {
+      if (await loadMessages()) status('New message received.');
+    } catch (error) {
+      status(error.message);
+    }
+  }, 5000);
+  status(localHistorySaved
+    ? 'Chat connected. Recent encrypted messages are saved on this device.'
+    : 'Chat connected. Local history could not be saved in this browser.');
 }
 async function enterRoom(code, name) {
   roomCode = code.toUpperCase().trim();
   nickname = name.trim();
   if (!/^\d{6}$/.test(roomCode) || !nickname) { status('Enter a 6-digit room code and name.'); return; }
-  if (realtimeChannel) await db.removeChannel(realtimeChannel);
-  realtimeChannel = null;
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+  lastMessageSignature = null;
   localHistorySaved = false;
   saveProfile();
   $('roomCode').textContent = `Room ${roomCode}`;
@@ -452,7 +496,6 @@ async function enterRoom(code, name) {
   $('headerAvatar').textContent = nickname.charAt(0).toUpperCase();
   showPage('chat');
   try {
-    await ensureAnonymousSession();
     await loadMessages();
     subscribe();
   } catch (error) {
@@ -493,15 +536,13 @@ $('profileName').addEventListener('input', () => {
 $('send').addEventListener('click', async () => {
   const text = $('plain').value; const secret = encryptionSecret;
   if (!text) { status('Write a message first.'); return; }
-  if (!anonymousUser) { status('You are viewing saved history offline. Reconnect before sending messages.'); return; }
+  if (!apiToken) { status('Sign in again before sending messages.'); return; }
   try {
-    const { error } = await db.from('messages').insert({
-      sender_id: anonymousUser.id,
+    await apiRequest('/api/messages', { method: 'POST', body: JSON.stringify({
       sender_email: nickname,
       receiver_email: roomCode,
       encrypted_text: await encryptMessage(text, secret)
-    });
-    if (error) throw error;
+    }) });
     $('plain').value = ''; status('Encrypted message sent.'); await loadMessages();
   } catch (error) { status(error.message || 'Could not send message.'); }
 });
@@ -512,9 +553,9 @@ $('plain').addEventListener('keydown', (event) => {
   }
 });
 $('refresh').addEventListener('click', async () => { try { await loadMessages(); status('Refreshed.'); } catch (error) { status(error.message); } });
-$('leave').addEventListener('click', async () => {
-  if (realtimeChannel) await db.removeChannel(realtimeChannel);
-  realtimeChannel = null; roomCode = ''; nickname = ''; $('messages').replaceChildren();
+$('leave').addEventListener('click', () => {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null; lastMessageSignature = null; roomCode = ''; nickname = ''; $('messages').replaceChildren();
   savedProfile.room = '';
   localStorage.setItem(PROFILE_KEY, JSON.stringify(savedProfile));
   $('joinCode').value = '';

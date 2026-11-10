@@ -1,51 +1,67 @@
 # Private Live Chat
 
-The app uses the existing `messages` columns, so no `sender_name` column is
-needed. Run this in Supabase **SQL Editor**:
+## Hosting
+
+GitHub Pages hosts only the static page. It cannot run the Python API or protect
+Supabase credentials. Keep `index.html` and `api-config.js` on GitHub Pages and
+host `server.py` separately on an HTTPS Python host. Set
+`window.CHAT_API_BASE_URL` in `api-config.js` to that API's HTTPS origin.
+
+The API accepts requests only from the configured browser origins. Set
+`CHAT_ALLOWED_ORIGINS` on the API host to a comma-separated list of exact
+origins, for example `https://23e4rtyuyf.github.io`. Do not use `*`.
+
+## Server secrets
+
+Configure these on the API host, never in GitHub or `api-config.js`:
+
+- `CHAT_ACCESS_PASSWORD`: the shared password users enter. It stays server-side;
+  the browser sends a challenge proof, not the password.
+- `SUPABASE_SERVICE_ROLE_KEY`: the Supabase server-only service-role key.
+- `SESSION_SECRET`: a long, random value used to protect session records.
+
+The server also uses the existing Supabase project's publishable key only for
+creating the anonymous Auth users required by the existing `sender_id` column.
+The browser no longer loads the Supabase client or makes Supabase requests.
+
+The browser keeps its short-lived API token in memory only. It is not written to
+local storage, so users sign in again after a reload or in a new tab. Encrypted
+chat history and the existing room/profile data remain local to each device.
+Message contents are encrypted in the browser; the server receives ciphertext.
+The server polls Supabase for updates instead of exposing Supabase Realtime to
+the browser.
+
+Choose a long, random shared password. The challenge proof never sends the
+password itself, but an intercepted proof can be checked against guesses; the
+PBKDF2 work factor slows those guesses but does not replace a strong password.
+
+## Lock down direct Supabase access
+
+The old setup allowed anonymous browser requests to read and write all rooms.
+After the server is configured and working, the following SQL closes that
+direct database path while allowing the server's service-role key to operate.
+This changes production database permissions. Review and explicitly approve
+before running it in the Supabase SQL Editor:
 
 ```sql
 alter table public.messages enable row level security;
-
-drop policy if exists "send own messages" on public.messages;
-drop policy if exists "read sent or received messages" on public.messages;
-drop policy if exists "users can send messages" on public.messages;
-drop policy if exists "users can read their messages" on public.messages;
-drop policy if exists "anyone can send to a room" on public.messages;
-drop policy if exists "anyone can read a room" on public.messages;
-
-create policy "chat can send encrypted messages"
-on public.messages for insert
-to anon, authenticated
-with check (
-  length(sender_email) between 1 and 40
-  and receiver_email ~ '^[A-Z0-9]{6,12}$'
-  and length(encrypted_text) > 30
-);
-
-create policy "chat can read encrypted messages"
-on public.messages for select
-to anon, authenticated
-using (receiver_email ~ '^[A-Z0-9]{6,12}$');
-
-do $$
-begin
-  if not exists (
-    select 1 from pg_publication_tables
-    where pubname = 'supabase_realtime'
-      and schemaname = 'public'
-      and tablename = 'messages'
-  ) then
-    alter publication supabase_realtime add table public.messages;
-  end if;
-end $$;
+revoke all privileges on table public.messages from anon, authenticated, public;
+grant select, insert on table public.messages to service_role;
 ```
 
-In this simple design, `sender_email` stores the nickname and `receiver_email`
-stores the room code. Only encrypted ciphertext is stored; the passphrase is
-never sent to Supabase. A strong passphrase protects message contents, but no
-public website can be guaranteed impossible to hack.
+Do not restore public `anon` read/insert grants or policies for `messages`.
+Direct anonymous Auth signup remains enabled only because the server creates a
+guest Auth user for the existing `sender_id` column.
 
-Enable **Authentication → Providers → Anonymous Sign-Ins** in Supabase.
-The app creates a hidden guest session automatically; users do not create or
-enter an account. This is required because the existing table requires
-`sender_id`.
+## Local Replit preview
+
+The configured **Start application** workflow runs:
+
+```sh
+python3 server.py
+```
+
+It serves the page and API on port 5000. For local preview, leave
+`CHAT_API_BASE_URL` empty. Ensure `CHAT_ALLOWED_ORIGINS` includes the current
+HTTPS Replit preview origin. Replit does not automatically configure Supabase
+or apply database permissions.
