@@ -5,7 +5,6 @@ needed. Run this in Supabase **SQL Editor**:
 
 ```sql
 alter table public.messages enable row level security;
-alter table public.messages alter column sender_id drop not null;
 
 drop policy if exists "send own messages" on public.messages;
 drop policy if exists "read sent or received messages" on public.messages;
@@ -45,3 +44,8 @@ In this simple design, `sender_email` stores the nickname and `receiver_email`
 stores the room code. Only encrypted ciphertext is stored; the passphrase is
 never sent to Supabase. A strong passphrase protects message contents, but no
 public website can be guaranteed impossible to hack.
+
+Enable **Authentication → Providers → Anonymous Sign-Ins** in Supabase.
+The app creates a hidden guest session automatically; users do not create or
+enter an account. This is required because the existing table requires
+`sender_id`.
