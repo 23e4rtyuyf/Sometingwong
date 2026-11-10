@@ -86,9 +86,9 @@
     </form>
   </section>
   <dialog id="termsDialog" class="terms-dialog" aria-labelledby="termsDialogTitle">
-    <h2 id="termsDialogTitle">Terms of Service and school-use notice</h2>
+    <h2 id="termsDialogTitle">Terms of Service</h2>
     <div class="terms-content">
-        <p><strong>School use:</strong> If you work at or attend a school and choose to use this platform, do so only where permitted by your school’s policies and applicable law. Do not use a school-managed device, account, or network for private communications unless you understand and accept its monitoring policies. A school or network operator may monitor, block, or record activity on its devices, accounts, or network. Encryption cannot prevent monitoring of a compromised or monitored device.</p>
+        <p><strong>School employees:</strong> If you are an employee of a school, school district, or educational institution, you may not access or use this Platform.</p>
         <h2>1. Acceptance of terms</h2>
         <p>By accessing or using the Private Messages application (the “Platform”), you agree to these Terms of Service. If you do not agree, do not use the Platform.</p>
         <h2>2. Privacy and data security</h2>
@@ -99,7 +99,6 @@
         <p>The Platform is provided “AS IS” and “AS AVAILABLE,” without warranties of any kind, express or implied, including merchantability, fitness for a particular purpose, or non-infringement. The creators do not guarantee uninterrupted, secure, or error-free service.</p>
         <h2>4. Limitation of liability</h2>
         <p>To the maximum extent permitted by applicable law, the Platform and its creators, developers, and affiliates are not liable for direct, indirect, incidental, special, consequential, or exemplary damages arising from use of the Platform.</p>
-        <p>The creators are not responsible for school discipline or other consequences resulting from your use, or for school monitoring, blocking, or action involving school-owned devices, school-issued accounts, or school networks.</p>
         <p>To the maximum extent permitted by applicable law, the creators’ aggregate liability for claims relating to these Terms or the Platform is limited to $0.00. Some laws do not allow certain warranty exclusions or liability limits, so those limits may not apply to you.</p>
         <h2>5. Indemnification</h2>
         <p>To the maximum extent permitted by applicable law, you agree to indemnify and hold harmless the Platform’s creators, developers, and affiliates from claims and expenses (including reasonable attorney’s fees) arising from your use of the Platform, your violation of these Terms, or your violation of third-party rights, school policies, or applicable law.</p>
@@ -108,7 +107,7 @@
     </div>
     <label class="terms-ack" for="acceptTerms">
       <input id="acceptTerms" type="checkbox">
-      <span>I have read and agree to the Terms of Service. I understand school devices and networks may be monitored.</span>
+      <span>I have read and agree to the Terms of Service.</span>
     </label>
     <p id="termsStatus" class="status" role="status" aria-live="polite"></p>
     <div class="dialog-actions">
@@ -123,7 +122,7 @@
     <button id="chatTab" class="active">Live Chat</button>
     <button id="classicTab" class="secondary">Classic Encryption</button>
   </nav>
-  <p class="small">Your name and last room are saved on this device. Your password is never saved.</p>
+  <p class="small">Your last room and recent encrypted messages are saved on this device. Your password is never saved.</p>
 
   <section id="chatPage">
   <section id="rooms" class="grid">
@@ -216,6 +215,9 @@ const SUPABASE_ANON_KEY = 'sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM';
 const ACCESS_PASSWORD_HASH = '8cbbcf29d9cef89675c5f5c1dcfe827d0570416a5aaba30dd0de159661ad905b';
 const ITERATIONS = 600000;
 const PROFILE_KEY = 'private-chat-profile-v1';
+const MESSAGE_CACHE_PREFIX = 'private-chat-encrypted-history-v1:';
+const MAX_CACHED_MESSAGES = 100;
+const MAX_CACHE_CHARS = 750000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -226,8 +228,43 @@ let realtimeChannel = null;
 let anonymousUser = null;
 let encryptionSecret = '';
 let termsAccepted = false;
+let savedProfile = {};
+let localHistorySaved = false;
 
 function status(message) { $('status').textContent = message; }
+function readCachedMessages(code) {
+  try {
+    const messages = JSON.parse(localStorage.getItem(`${MESSAGE_CACHE_PREFIX}${code}`) || '[]');
+    if (!Array.isArray(messages)) return [];
+    return messages.filter((item) => item && (typeof item.id === 'string' || typeof item.id === 'number')
+      && typeof item.created_at === 'string' && typeof item.sender_email === 'string'
+      && typeof item.encrypted_text === 'string');
+  } catch {
+    return [];
+  }
+}
+function cacheEncryptedMessages(code, messages) {
+  let retained = messages.filter((item) => item && typeof item.created_at === 'string'
+    && typeof item.sender_email === 'string' && typeof item.encrypted_text === 'string')
+    .map((item) => ({
+      id: item.id,
+      created_at: item.created_at,
+      sender_email: item.sender_email,
+      encrypted_text: item.encrypted_text
+    })).slice(-MAX_CACHED_MESSAGES);
+  let serialized = JSON.stringify(retained);
+  while (retained.length > 1 && serialized.length > MAX_CACHE_CHARS) {
+    retained.shift();
+    serialized = JSON.stringify(retained);
+  }
+  if (serialized.length > MAX_CACHE_CHARS) return false;
+  try {
+    localStorage.setItem(`${MESSAGE_CACHE_PREFIX}${code}`, serialized);
+    return true;
+  } catch {
+    return false;
+  }
+}
 function loadProfile() {
   try {
     const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
@@ -239,8 +276,10 @@ function loadProfile() {
     $('profileId').textContent = profile.id;
     localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
     if (typeof profile.room === 'string') $('joinCode').value = profile.room;
+    return profile;
   } catch {
     localStorage.removeItem(PROFILE_KEY);
+    return {};
   }
 }
 function saveProfile() {
@@ -249,6 +288,7 @@ function saveProfile() {
   profile.name = nickname;
   profile.room = roomCode;
   localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+  savedProfile = profile;
   $('profileName').value = nickname;
   $('profileId').textContent = profile.id;
 }
@@ -293,6 +333,9 @@ $('accessForm').addEventListener('submit', async (event) => {
   showPage('chat');
   $('rooms').classList.remove('hidden');
   $('chat').classList.add('hidden');
+  if (savedProfile.room && savedProfile.name) {
+    await enterRoom(savedProfile.room, savedProfile.name);
+  }
 });
 function randomCode() {
   return String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
@@ -349,10 +392,7 @@ async function ensureAnonymousSession() {
   if (error) throw new Error('Guest access is not enabled in Supabase yet.');
   anonymousUser = data.user;
 }
-async function loadMessages() {
-  const { data, error } = await db.from('messages').select('id, created_at, sender_email, encrypted_text')
-    .eq('receiver_email', roomCode).order('created_at', { ascending: true });
-  if (error) throw error;
+async function renderMessages(data) {
   const container = $('messages');
   container.replaceChildren();
   if (!data.length) {
@@ -377,17 +417,33 @@ async function loadMessages() {
   }
   container.lastElementChild?.scrollIntoView({ block: 'nearest' });
 }
+async function loadMessages() {
+  const { data, error } = await db.from('messages').select('id, created_at, sender_email, encrypted_text')
+    .eq('receiver_email', roomCode).order('created_at', { ascending: true });
+  if (error) throw error;
+  localHistorySaved = cacheEncryptedMessages(roomCode, data);
+  await renderMessages(data);
+}
 function subscribe() {
   if (realtimeChannel) db.removeChannel(realtimeChannel);
   realtimeChannel = db.channel(`room-${roomCode}`)
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `receiver_email=eq.${roomCode}` },
       async () => { await loadMessages(); status('New message received.'); })
-    .subscribe((state) => { if (state === 'SUBSCRIBED') status('Live chat connected.'); });
+    .subscribe((state) => {
+      if (state === 'SUBSCRIBED') {
+        status(localHistorySaved
+          ? 'Live chat connected. Recent encrypted messages are saved on this device.'
+          : 'Live chat connected. Local history could not be saved in this browser.');
+      }
+    });
 }
 async function enterRoom(code, name) {
   roomCode = code.toUpperCase().trim();
   nickname = name.trim();
   if (!/^\d{6}$/.test(roomCode) || !nickname) { status('Enter a 6-digit room code and name.'); return; }
+  if (realtimeChannel) await db.removeChannel(realtimeChannel);
+  realtimeChannel = null;
+  localHistorySaved = false;
   saveProfile();
   $('roomCode').textContent = `Room ${roomCode}`;
   $('identity').textContent = `You are ${nickname}`;
@@ -400,7 +456,14 @@ async function enterRoom(code, name) {
     await loadMessages();
     subscribe();
   } catch (error) {
-    status(error.message);
+    const cached = readCachedMessages(roomCode);
+    if (!cached.length) {
+      status(error.message);
+      return;
+    }
+    localHistorySaved = true;
+    await renderMessages(cached);
+    status('Showing encrypted history saved on this device. Reconnect to refresh or send messages.');
   }
 }
 $('createRoom').addEventListener('click', () => enterRoom(randomCode(), $('createName').value));
@@ -420,6 +483,7 @@ $('profileName').addEventListener('input', () => {
   profile.id ||= `user-${crypto.randomUUID().slice(0, 8)}`;
   profile.name = name;
   localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+  savedProfile = profile;
   $('createName').value = name;
   $('joinName').value = name;
   if (roomCode) nickname = name;
@@ -429,6 +493,7 @@ $('profileName').addEventListener('input', () => {
 $('send').addEventListener('click', async () => {
   const text = $('plain').value; const secret = encryptionSecret;
   if (!text) { status('Write a message first.'); return; }
+  if (!anonymousUser) { status('You are viewing saved history offline. Reconnect before sending messages.'); return; }
   try {
     const { error } = await db.from('messages').insert({
       sender_id: anonymousUser.id,
@@ -450,6 +515,9 @@ $('refresh').addEventListener('click', async () => { try { await loadMessages();
 $('leave').addEventListener('click', async () => {
   if (realtimeChannel) await db.removeChannel(realtimeChannel);
   realtimeChannel = null; roomCode = ''; nickname = ''; $('messages').replaceChildren();
+  savedProfile.room = '';
+  localStorage.setItem(PROFILE_KEY, JSON.stringify(savedProfile));
+  $('joinCode').value = '';
   showPage('chat'); status('Left room.');
 });
 $('chatTab').addEventListener('click', () => showPage('chat'));
@@ -484,7 +552,7 @@ $('classicDecrypt').addEventListener('click', async () => {
     status('Could not decrypt. Check the message and password.');
   }
 });
-loadProfile();
+savedProfile = loadProfile();
 </script>
 </body>
 </html>
