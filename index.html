@@ -4,218 +4,226 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Private Message Encryptor</title>
+  <title>Private Messages</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     :root { color-scheme: dark; font: 16px system-ui, sans-serif; }
-    body { max-width: 860px; margin: 0 auto; padding: 2rem 1rem; background: #111827; color: #f9fafb; }
+    body { max-width: 900px; margin: 0 auto; padding: 2rem 1rem; background: #111827; color: #f9fafb; }
     main { background: #1f2937; border-radius: 12px; padding: 1.25rem; }
     h1 { margin-top: 0; }
+    h2 { font-size: 1.15rem; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    .card { border: 1px solid #374151; border-radius: 8px; padding: 1rem; }
     label { display: block; margin: .8rem 0 .35rem; font-weight: 600; }
     input, textarea, button { box-sizing: border-box; width: 100%; padding: .7rem; border-radius: 7px; border: 1px solid #4b5563; font: inherit; }
     input, textarea { background: #111827; color: inherit; }
-    textarea { min-height: 180px; resize: vertical; }
+    textarea { min-height: 130px; resize: vertical; }
     button { margin-top: 1rem; background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
     button.secondary { background: #374151; }
+    button.danger { background: #991b1b; }
     .hidden { display: none; }
     .status { min-height: 1.4em; margin-top: .8rem; color: #fbbf24; }
     .small { color: #9ca3af; font-size: .9rem; }
-    .card { border: 1px solid #374151; border-radius: 8px; padding: 1rem; }
+    .message { border-top: 1px solid #374151; padding: .8rem 0; }
+    .message pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .5rem 0 0; }
   </style>
 </head>
 <body>
   <main>
-    <h1>Private Message Encryptor</h1>
+    <h1>Private Messages</h1>
+    <p class="small">Messages are encrypted in your browser before Supabase receives them.</p>
+
     <section id="gate">
-      <p class="small">Enter the access code to open the message tools.</p>
       <label for="accessCode">Access code</label>
       <input id="accessCode" type="password" autocomplete="current-password">
       <button id="unlock">Unlock</button>
     </section>
 
+    <section id="auth" class="hidden">
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="email">
+      <label for="accountPassword">Account password</label>
+      <input id="accountPassword" type="password" autocomplete="current-password">
+      <button id="signIn">Sign in</button>
+      <button id="signUp" class="secondary">Create account</button>
+    </section>
+
     <section id="app" class="hidden">
-    <p class="small">Use the access code with your friend. Messages are encrypted locally and never uploaded.</p>
-
-    <div class="grid">
+      <p id="signedInAs" class="small"></p>
+      <div class="grid">
+        <section class="card">
+          <h2>Send encrypted message</h2>
+          <label for="recipient">Friend's account email</label>
+          <input id="recipient" type="email" autocomplete="off">
+          <label for="plain">Message</label>
+          <textarea id="plain" autocomplete="off"></textarea>
+          <button id="send">Encrypt and send</button>
+        </section>
+        <section class="card">
+          <h2>Encryption passphrase</h2>
+          <p class="small">Both people must use the same passphrase. It is never sent to Supabase.</p>
+          <label for="messagePassphrase">Passphrase</label>
+          <input id="messagePassphrase" type="password" autocomplete="off">
+          <button id="refresh" class="secondary">Refresh messages</button>
+          <button id="signOut" class="danger">Sign out and lock</button>
+        </section>
+      </div>
       <section class="card">
-        <h2>Encrypt a message</h2>
-        <label for="plain">Message</label>
-        <textarea id="plain" autocomplete="off" placeholder="Type a private message"></textarea>
-        <button id="encrypt">Encrypt message</button>
-        <label for="encrypted">Encrypted message to copy</label>
-        <textarea id="encrypted" readonly spellcheck="false"></textarea>
-        <button id="copy" class="secondary">Copy encrypted message</button>
+        <h2>Messages</h2>
+        <div id="messages"></div>
       </section>
-
-      <section class="card">
-        <h2>Decrypt a message</h2>
-        <label for="incoming">Paste encrypted message</label>
-        <textarea id="incoming" spellcheck="false" autocomplete="off"></textarea>
-        <button id="decrypt">Decrypt message</button>
-        <label for="decrypted">Decrypted message</label>
-        <textarea id="decrypted" readonly></textarea>
-      </section>
-    </div>
-    <button id="lock" class="secondary">Lock</button>
     </section>
     <div id="status" class="status" role="status" aria-live="polite"></div>
   </main>
 
   <script>
     'use strict';
+    const SUPABASE_URL = 'https://iozdwksqfhlhcrbhrwfl.supabase.co';
+    const SUPABASE_ANON_KEY = 'sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM';
+    const ACCESS_CODE_HASH = '8cbbcf29d9cef89675c5f5c1dcfe827d0570416a5aaba30dd0de159661ad905b';
     const ITERATIONS = 600000;
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
+    const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
     const $ = (id) => document.getElementById(id);
-    const ACCESS_CODE_HASH = '8cbbcf29d9cef89675c5f5c1dcfe827d0570416a5aaba30dd0de159661ad905b';
-    let passphrase = '';
+    let accessCode = '';
+    let user = null;
 
+    function status(message) { $('status').textContent = message; }
     function toBase64(bytes) {
       let binary = '';
       for (const byte of bytes) binary += String.fromCharCode(byte);
       return btoa(binary);
     }
-
     function fromBase64(value) {
       const binary = atob(value);
       return Uint8Array.from(binary, (char) => char.charCodeAt(0));
     }
-
-    function bytesToHex(bytes) {
-      return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-    }
-
-    async function hashAccessCode(code) {
-      const digest = await crypto.subtle.digest('SHA-256', encoder.encode(code));
-      return bytesToHex(new Uint8Array(digest));
-    }
-
     function toBase64Url(bytes) {
-      return toBase64(bytes)
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/g, '');
+      return toBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
     }
-
     function fromBase64Url(value) {
       const padded = value.replace(/-/g, '+').replace(/_/g, '/')
         + '='.repeat((4 - value.length % 4) % 4);
       return fromBase64(padded);
     }
-
+    function bytesToHex(bytes) {
+      return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    }
+    async function hash(value) {
+      return bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value))));
+    }
     async function deriveKey(passphrase, salt) {
-      const material = await crypto.subtle.importKey(
-        'raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveKey']
-      );
+      const material = await crypto.subtle.importKey('raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
       return crypto.subtle.deriveKey(
         { name: 'PBKDF2', salt, iterations: ITERATIONS, hash: 'SHA-256' },
-        material,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['encrypt', 'decrypt']
+        material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
       );
     }
-
     async function encryptMessage(message, passphrase) {
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const key = await deriveKey(passphrase, salt);
-      const ciphertext = await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv }, key, encoder.encode(message)
-      );
-      const encrypted = new Uint8Array(3 + salt.length + iv.length + ciphertext.byteLength);
-      encrypted.set([80, 77, 2], 0);
-      encrypted.set(salt, 3);
-      encrypted.set(iv, 3 + salt.length);
-      encrypted.set(new Uint8Array(ciphertext), 3 + salt.length + iv.length);
-      return `PM2.${toBase64Url(encrypted)}`;
+      const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(message));
+      const result = new Uint8Array(3 + salt.length + iv.length + ciphertext.byteLength);
+      result.set([80, 77, 2], 0);
+      result.set(salt, 3);
+      result.set(iv, 19);
+      result.set(new Uint8Array(ciphertext), 31);
+      return `PM2.${toBase64Url(result)}`;
     }
-
     async function decryptMessage(record, passphrase) {
-      if (record.startsWith('PM2.')) {
-        const encrypted = fromBase64Url(record.slice(4));
-        if (encrypted.length < 32 || encrypted[0] !== 80 || encrypted[1] !== 77 || encrypted[2] !== 2) {
-          throw new Error('Unsupported message format');
-        }
-        const salt = encrypted.slice(3, 19);
-        const iv = encrypted.slice(19, 31);
-        const ciphertext = encrypted.slice(31);
-        const key = await deriveKey(passphrase, salt);
-        const plaintext = await crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv }, key, ciphertext
-        );
-        return decoder.decode(plaintext);
-      }
-
-      const data = JSON.parse(record);
-      if (data.app !== 'private-message' || data.version !== 1 || data.iterations !== ITERATIONS) {
+      const data = fromBase64Url(record.slice(4));
+      if (!record.startsWith('PM2.') || data.length < 32 || data[0] !== 80 || data[1] !== 77 || data[2] !== 2) {
         throw new Error('Unsupported message format');
       }
-      const key = await deriveKey(passphrase, fromBase64(data.salt));
-      const plaintext = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: fromBase64(data.iv) },
-        key,
-        fromBase64(data.ciphertext)
-      );
+      const key = await deriveKey(passphrase, data.slice(3, 19));
+      const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.slice(19, 31) }, key, data.slice(31));
       return decoder.decode(plaintext);
     }
-
-    function status(message) { $('status').textContent = message; }
-
+    function show(section) {
+      for (const id of ['gate', 'auth', 'app']) $(id).classList.toggle('hidden', id !== section);
+    }
+    async function loadMessages() {
+      const { data, error } = await supabase.from('messages').select('id, created_at, sender_email, encrypted_text').order('created_at', { ascending: false });
+      if (error) throw error;
+      const container = $('messages');
+      container.replaceChildren();
+      if (!data.length) {
+        container.textContent = 'No messages yet.';
+        return;
+      }
+      for (const message of data) {
+        const row = document.createElement('div');
+        row.className = 'message';
+        const meta = document.createElement('div');
+        meta.className = 'small';
+        meta.textContent = `${message.sender_email} · ${new Date(message.created_at).toLocaleString()}`;
+        const text = document.createElement('pre');
+        text.textContent = '[Encrypted] Enter the passphrase and press Decrypt.';
+        const decrypt = document.createElement('button');
+        decrypt.textContent = 'Decrypt';
+        decrypt.className = 'secondary';
+        decrypt.addEventListener('click', async () => {
+          try {
+            text.textContent = await decryptMessage(message.encrypted_text, $('messagePassphrase').value);
+          } catch {
+            text.textContent = 'Could not decrypt with that passphrase.';
+          }
+        });
+        row.append(meta, text, decrypt);
+        container.append(row);
+      }
+    }
+    async function finishAuth() {
+      const { data } = await supabase.auth.getUser();
+      user = data.user;
+      if (!user) return;
+      $('signedInAs').textContent = `Signed in as ${user.email}`;
+      show('app');
+      await loadMessages();
+    }
     $('unlock').addEventListener('click', async () => {
       const candidate = $('accessCode').value;
-      if (!candidate || await hashAccessCode(candidate) !== ACCESS_CODE_HASH) {
-        return status('Incorrect access code.');
-      }
-      passphrase = candidate;
+      if (!candidate || await hash(candidate) !== ACCESS_CODE_HASH) return status('Incorrect access code.');
+      accessCode = candidate;
       $('accessCode').value = '';
-      $('gate').classList.add('hidden');
-      $('app').classList.remove('hidden');
-      status('Unlocked.');
+      show('auth');
+      status('Access granted. Sign in or create an account.');
     });
-
-    $('encrypt').addEventListener('click', async () => {
-      const message = $('plain').value;
-      if (!passphrase || !message) return status('Enter a passphrase and message.');
-      try {
-        $('encrypted').value = await encryptMessage(message, passphrase);
-        status('Message encrypted. Copy the encrypted text and send it to your friend.');
-      } catch {
-        status('Encryption failed.');
-      }
+    $('signIn').addEventListener('click', async () => {
+      const { error } = await supabase.auth.signInWithPassword({ email: $('email').value, password: $('accountPassword').value });
+      if (error) return status(error.message);
+      await finishAuth();
     });
-
-    $('copy').addEventListener('click', async () => {
-      if (!$('encrypted').value) return status('Encrypt a message first.');
-      try {
-        await navigator.clipboard.writeText($('encrypted').value);
-        status('Encrypted message copied.');
-      } catch {
-        $('encrypted').select();
-        status('Copy was blocked. Select and copy the encrypted text manually.');
-      }
+    $('signUp').addEventListener('click', async () => {
+      const { error } = await supabase.auth.signUp({ email: $('email').value, password: $('accountPassword').value });
+      if (error) return status(error.message);
+      status('Account created. Check your email if confirmation is enabled, then sign in.');
     });
-
-    $('decrypt').addEventListener('click', async () => {
-      const incoming = $('incoming').value.trim();
-      if (!passphrase || !incoming) return status('Enter a passphrase and encrypted message.');
-      try {
-        $('decrypted').value = await decryptMessage(incoming, passphrase);
-        status('Message decrypted.');
-      } catch {
-        status('Could not decrypt. Check the passphrase and complete encrypted message.');
-      }
-    });
-
-    $('lock').addEventListener('click', () => {
-      passphrase = '';
+    $('send').addEventListener('click', async () => {
+      const passphrase = $('messagePassphrase').value;
+      const text = $('plain').value;
+      const recipient = $('recipient').value.trim().toLowerCase();
+      if (!recipient || !text || !passphrase) return status('Enter recipient, message, and passphrase.');
+      const encrypted = await encryptMessage(text, passphrase);
+      const { error } = await supabase.from('messages').insert({
+        encrypted_text: encrypted, sender_id: user.id, sender_email: user.email, receiver_email: recipient
+      });
+      if (error) return status(error.message);
       $('plain').value = '';
-      $('encrypted').value = '';
-      $('incoming').value = '';
-      $('decrypted').value = '';
-      $('app').classList.add('hidden');
-      $('gate').classList.remove('hidden');
-      status('Locked.');
+      status('Encrypted message sent.');
+      await loadMessages();
+    });
+    $('refresh').addEventListener('click', async () => {
+      try { await loadMessages(); status('Messages refreshed.'); } catch (error) { status(error.message); }
+    });
+    $('signOut').addEventListener('click', async () => {
+      await supabase.auth.signOut();
+      accessCode = '';
+      user = null;
+      show('gate');
+      status('Signed out and locked.');
     });
   </script>
 </body>
