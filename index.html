@@ -117,6 +117,7 @@ const $ = (id) => document.getElementById(id);
 let roomCode = '';
 let nickname = '';
 let realtimeChannel = null;
+let anonymousUser = null;
 
 function status(message) { $('status').textContent = message; }
 function randomCode() {
@@ -162,6 +163,16 @@ function showPage(page) {
   $('chatTab').classList.toggle('active', chat);
   $('classicTab').classList.toggle('active', !chat);
 }
+async function ensureAnonymousSession() {
+  const { data: sessionData } = await db.auth.getSession();
+  if (sessionData.session?.user) {
+    anonymousUser = sessionData.session.user;
+    return;
+  }
+  const { data, error } = await db.auth.signInAnonymously();
+  if (error) throw new Error('Guest access is not enabled in Supabase yet.');
+  anonymousUser = data.user;
+}
 async function loadMessages() {
   const { data, error } = await db.from('messages').select('id, created_at, sender_email, encrypted_text')
     .eq('receiver_email', roomCode).order('created_at', { ascending: true });
@@ -196,7 +207,13 @@ async function enterRoom(code, name) {
   if (!/^[A-Z0-9]{6,12}$/.test(roomCode) || !nickname) { status('Enter a valid room code and name.'); return; }
   $('roomCode').textContent = roomCode; $('identity').textContent = `You are ${nickname}`;
   $('rooms').classList.add('hidden'); $('chat').classList.remove('hidden');
-  try { await loadMessages(); subscribe(); } catch (error) { status(error.message); }
+  try {
+    await ensureAnonymousSession();
+    await loadMessages();
+    subscribe();
+  } catch (error) {
+    status(error.message);
+  }
 }
 $('createRoom').addEventListener('click', () => enterRoom(randomCode(), $('createName').value));
 $('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('joinName').value));
@@ -205,6 +222,7 @@ $('send').addEventListener('click', async () => {
   if (!text || !secret) { status('Enter a message and passphrase.'); return; }
   try {
     const { error } = await db.from('messages').insert({
+      sender_id: anonymousUser.id,
       sender_email: nickname,
       receiver_email: roomCode,
       encrypted_text: await encryptMessage(text, secret)
