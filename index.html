@@ -46,6 +46,11 @@
     <button id="chatTab" class="active">Live Chat</button>
     <button id="classicTab" class="secondary">Classic Encryption</button>
   </nav>
+  <div class="card">
+    <label for="passphrase">Encryption passphrase</label>
+    <p class="small">Use this same passphrase for Live Chat and Classic Encryption.</p>
+    <input id="passphrase" type="password" autocomplete="off">
+  </div>
 
   <section id="chatPage">
   <section id="rooms" class="grid">
@@ -92,9 +97,6 @@
     <p class="small">Room code: <strong id="roomCode"></strong> — share it with your friend.</p>
     <div class="grid">
       <div class="card">
-        <label for="passphrase">Encryption passphrase</label>
-        <p class="small">This one passphrase is used for Live Chat and Classic Encryption.</p>
-        <input id="passphrase" type="password" autocomplete="off">
         <label for="plain">Message</label>
         <textarea id="plain"></textarea>
         <button id="send">Encrypt and send</button>
