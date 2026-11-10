@@ -50,13 +50,16 @@ GitHub repository.
 
 ## 4. Check the function before switching the site
 
-The expected function base URL is:
+The function's base URL is the URL shown in the Functions list. The Dashboard's
+editable **Name** can differ from the deployed URL slug; changing the name does
+not rename the endpoint. This project's deployed URL is:
 
 ```text
-https://iozdwksqfhlhcrbhrwfl.supabase.co/functions/v1/chat-api
+https://iozdwksqfhlhcrbhrwfl.supabase.co/functions/v1/swift-endpoint
 ```
 
-Before changing `api-config.js`, verify that `/api/health` returns
+The function source handles subpaths independently of that slug. Before
+changing `api-config.js`, verify that `/api/health` returns
 `{"ok":true,"storageConfigured":true,"authConfigured":true}` and that
 `/api/auth/challenge` returns HTTP 200 from the GitHub Pages origin.
 

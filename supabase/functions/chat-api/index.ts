@@ -67,10 +67,13 @@ function requireOrigin(request) {
 
 function routeFromUrl(rawUrl) {
   const pathname = new URL(rawUrl).pathname;
-  const functionMarker = "/functions/v1/chat-api";
-  const markerIndex = pathname.indexOf(functionMarker);
-  if (markerIndex >= 0) {
-    return pathname.slice(markerIndex + functionMarker.length) || "/";
+  const functionPrefix = "/functions/v1/";
+  const prefixIndex = pathname.indexOf(functionPrefix);
+  if (prefixIndex >= 0) {
+    // Dashboard display names can differ from the deployed function URL slug.
+    const functionPath = pathname.slice(prefixIndex + functionPrefix.length);
+    const routeIndex = functionPath.indexOf("/");
+    return routeIndex >= 0 ? functionPath.slice(routeIndex) || "/" : "/";
   }
   return pathname;
 }

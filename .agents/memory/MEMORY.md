@@ -1,2 +1,3 @@
 - [GitHub Pages hosting](github-pages-hosting.md) — Keep the chat frontend static and host its Python API separately.
 - [PostgreSQL target selection](postgresql-target-selection.md) — Use an explicit target; ambient Replit PostgreSQL settings can select the local database.
+- [Supabase function URL slugs](supabase-function-url-slugs.md) — Use the copied endpoint URL; a Dashboard display name may not rename its deployed slug.
