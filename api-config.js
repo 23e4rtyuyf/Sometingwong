@@ -1,3 +1,6 @@
-// Set this to the HTTPS URL of the separately hosted Python API for GitHub Pages.
-// Leave empty when the page and API are served from the same origin.
-window.CHAT_API_BASE_URL = "https://privmessagez.replit.app";
+// GitHub Pages is static, so it calls the separately hosted Replit API.
+// Replit serves the API on the same origin and should use relative requests.
+window.CHAT_API_BASE_URL =
+  window.location.hostname === "23e4rtyuyf.github.io"
+    ? "https://privmessagez.replit.app"
+    : "";
