@@ -138,8 +138,11 @@
       <section class="chat-panel">
         <header class="chat-header">
           <span class="avatar" id="headerAvatar">P</span>
-          <div><strong id="roomCode"></strong><p id="identity" class="small"></p></div>
-          <button id="copyRoomCode" class="secondary">Copy room code</button><p id="identity" class="small"></p></div>
+          <div>
+            <strong id="roomCode"></strong>
+            <p id="identity" class="small"></p>
+          </div>
+          <button id="copyRoomCode" class="secondary">Copy room code</button>
         </header>
         <div class="chat-tools">
           <button id="refresh" class="secondary">Refresh</button>
@@ -213,6 +216,9 @@ $('unlock').addEventListener('click', async () => {
   $('accessGate').classList.add('hidden');
   $('protectedApp').classList.remove('hidden');
   encryptionSecret = candidate;
+  showPage('chat');
+  $('rooms').classList.remove('hidden');
+  $('chat').classList.add('hidden');
   $('accessPassword').value = '';
 });
 function randomCode() {
