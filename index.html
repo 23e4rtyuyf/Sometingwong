@@ -235,6 +235,7 @@ const AUTH_SALT = 'private-live-chat-auth-v1';
 const PROFILE_KEY = 'private-chat-profile-v1';
 const MESSAGE_CACHE_PREFIX = 'private-chat-encrypted-history-v1:';
 const MAX_CACHED_MESSAGES = 100;
+const MAX_DISPLAYED_MESSAGES = 500;
 const MAX_CACHE_CHARS = 750000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -242,7 +243,9 @@ const $ = (id) => document.getElementById(id);
 let roomCode = '';
 let nickname = '';
 let pollTimer = null;
-let lastMessageSignature = null;
+let renderedMessageIds = new Set();
+let messagesInitialized = false;
+let showingCachedHistory = false;
 let apiToken = '';
 let encryptionSecret = '';
 let activeRoomName = '';
@@ -449,16 +452,25 @@ function showPage(page) {
 }
 async function renderMessages(data) {
   const container = $('messages');
-  container.replaceChildren();
-  if (!data.length) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-chat';
-    empty.textContent = 'No messages yet. Say hello!';
-    container.append(empty);
-    return;
+  if (!data.length && renderedMessageIds.size === 0) {
+    if (!container.querySelector('.empty-chat')) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-chat';
+      empty.textContent = 'No messages yet. Say hello!';
+      container.replaceChildren(empty);
+    }
+    return 0;
   }
+  const wasNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 48;
+  container.querySelector('.empty-chat')?.remove();
+  let appended = 0;
   for (const item of data) {
-    const row = document.createElement('div');     row.className = `message${item.sender_email === nickname ? ' mine' : ''}`;
+    const messageId = String(item.id);
+    if (renderedMessageIds.has(messageId)) continue;
+    renderedMessageIds.add(messageId);
+    const row = document.createElement('div');
+    row.dataset.messageId = messageId;
+    row.className = `message${item.sender_email === nickname ? ' mine' : ''}`;
     const meta = document.createElement('div'); meta.className = 'message-meta';
     meta.textContent = `${item.sender_email} · ${new Date(item.created_at).toLocaleString()}`;
     const output = document.createElement('div');
@@ -468,9 +480,18 @@ async function renderMessages(data) {
     } catch {
       output.textContent = 'Message unavailable.';
     }
-    row.append(meta, output); container.append(row);
+    row.append(meta, output);
+    container.append(row);
+    appended += 1;
   }
-  container.lastElementChild?.scrollIntoView({ block: 'nearest' });
+  while (container.querySelectorAll('.message').length > MAX_DISPLAYED_MESSAGES) {
+    const oldest = container.querySelector('.message');
+    if (!oldest) break;
+    renderedMessageIds.delete(oldest.dataset.messageId);
+    oldest.remove();
+  }
+  if (appended && wasNearBottom) container.scrollTop = container.scrollHeight;
+  return appended;
 }
 async function loadMessages() {
   const result = await apiRequest(`/api/messages?room=${encodeURIComponent(roomCode)}`);
@@ -479,13 +500,19 @@ async function loadMessages() {
     activeRoomName = result.roomName;
     updateRoomHeading();
   }
-  const signature = messages.map((item) => item.id).join(',');
-  const hasNewMessages = lastMessageSignature !== null && signature !== lastMessageSignature;
-  if (signature === lastMessageSignature) return false;
-  lastMessageSignature = signature;
+  if (showingCachedHistory) {
+    renderedMessageIds.clear();
+    $('messages').replaceChildren();
+    messagesInitialized = false;
+    showingCachedHistory = false;
+  }
+  const firstLoad = !messagesInitialized;
+  const hasNewMessages = messages.some((item) => !renderedMessageIds.has(String(item.id)));
+  if (!firstLoad && !hasNewMessages) return false;
   localHistorySaved = cacheEncryptedMessages(roomCode, messages);
   await renderMessages(messages);
-  return hasNewMessages;
+  messagesInitialized = true;
+  return !firstLoad && hasNewMessages;
 }
 function subscribe() {
   if (pollTimer) clearInterval(pollTimer);
@@ -518,7 +545,10 @@ async function enterRoom(code, name) {
   }
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
-  lastMessageSignature = null;
+  renderedMessageIds.clear();
+  messagesInitialized = false;
+  showingCachedHistory = false;
+  $('messages').replaceChildren();
   localHistorySaved = false;
   let roomInfo;
   let offline = false;
@@ -548,6 +578,7 @@ async function enterRoom(code, name) {
     const cached = readCachedMessages(roomCode);
     localHistorySaved = true;
     await renderMessages(cached);
+    showingCachedHistory = true;
     status('Showing encrypted history saved on this device. Reconnect to open the shared chat.');
     return;
   }
@@ -562,6 +593,7 @@ async function enterRoom(code, name) {
     }
     localHistorySaved = true;
     await renderMessages(cached);
+    showingCachedHistory = true;
     status('Showing encrypted history saved on this device. Reconnect to refresh or send messages.');
   }
 }
@@ -663,7 +695,7 @@ $('plain').addEventListener('keydown', (event) => {
 $('refresh').addEventListener('click', async () => { try { await loadMessages(); status('Refreshed.'); } catch (error) { status(error.message); } });
 $('leave').addEventListener('click', () => {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = null; lastMessageSignature = null; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren();
+  pollTimer = null; renderedMessageIds.clear(); messagesInitialized = false; showingCachedHistory = false; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren();
   $('roomTitle').textContent = '';
   $('roomCode').textContent = '';
   $('sidebarName').textContent = 'Private room';
