@@ -53,7 +53,7 @@
     .profile-strip { max-width:850px; display:flex; align-items:center; gap:1rem; margin:1rem 0 0; padding:.85rem 1rem; border:1px solid var(--line); border-radius:13px; background:#e6eef9; }
     .profile-strip label { flex:0 0 auto; margin:0; }
     .profile-strip input { max-width:280px; padding:.55rem .7rem; background:#fff; }
-    .profile-strip .small { margin:0 0 0 auto; }
+    .profile-strip .small { flex:1; margin:0 0 0 auto; }
     #chat { max-width:1000px; margin:1.4rem auto 0; }
     .chat-layout { min-height:min(76vh,760px); display:flex; flex-direction:column; overflow:visible; border:1px solid var(--line); border-radius:16px; background:#fff; box-shadow:0 12px 38px #23416a12; }
     .chat-panel { display:flex; min-width:0; flex:1; flex-direction:column; }
@@ -226,7 +226,7 @@
     <div class="profile-strip">
       <label for="profileName">Your display name</label>
       <input id="profileName" maxlength="40" autocomplete="nickname" placeholder="Name others will see">
-      <p class="small">Saved on this device · Profile ID: <span id="profileId" class="profile-id"></span></p>
+      <p id="profileSyncStatus" class="small" role="status" aria-live="polite">Your name will sync to your account for other devices.</p>
     </div>
   </div>
   </section>
@@ -312,7 +312,11 @@ let locallyDeletedMessageIds = new Set();
 let messagesInitialized = false;
 let showingCachedHistory = false;
 let apiToken = '';
+let supabaseAccessToken = '';
+let accountDisplayName = '';
 let accessPassword = '';
+let profileSaveTimer = null;
+let profileSavePromise = Promise.resolve();
 let activeRoomName = '';
 let termsAccepted = false;
 let savedProfile = {};
@@ -326,6 +330,8 @@ function status(message) { $('status').textContent = message; }
 function lockForExpiredSession() {
   if (!apiToken) return;
   apiToken = '';
+  supabaseAccessToken = '';
+  accountDisplayName = '';
   accessPassword = '';
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
@@ -376,7 +382,44 @@ async function signInWithAccount(email, password) {
   if (!response.ok || typeof result.access_token !== 'string') {
     throw new Error('Account sign-in failed. Check your email and password.');
   }
-  return result.access_token;
+  return result;
+}
+async function saveAccountDisplayName(name) {
+  const displayName = String(name).trim();
+  if (!displayName || displayName.length > 40) {
+    throw new Error('Enter a name between 1 and 40 characters.');
+  }
+  if (!supabaseAccessToken) {
+    throw new Error('Sign in again to save your name to your account.');
+  }
+  if (displayName === accountDisplayName) return displayName;
+  const save = async () => {
+    let response;
+    try {
+      response = await fetch(`${window.CHAT_SUPABASE_URL}/auth/v1/user`, {
+        method: 'PUT',
+        headers: {
+          apikey: window.CHAT_API_KEY,
+          Authorization: `Bearer ${supabaseAccessToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ data: { display_name: displayName } }),
+        cache: 'no-store',
+      });
+    } catch {
+      throw new Error('Could not reach account settings. Check your connection and try again.');
+    }
+    if (!response.ok) {
+      throw new Error(response.status === 401
+        ? 'Your account session expired. Sign in again to save your name.'
+        : 'Could not save your name to your account. Try again.');
+    }
+    accountDisplayName = displayName;
+    return displayName;
+  };
+  profileSavePromise = profileSavePromise.catch(() => {}).then(save);
+  return profileSavePromise;
 }
 function openHistoryDatabase() {
   if (!window.indexedDB) return Promise.reject(new Error('This browser does not support local chat history.'));
@@ -534,10 +577,8 @@ async function pruneDeletedMessages(messages) {
 function loadProfile() {
   try {
     const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
-    if (!profile.id) profile.id = `user-${crypto.randomUUID().slice(0, 8)}`;
     if (typeof profile.name !== 'string') profile.name = '';
     $('profileName').value = profile.name;
-    $('profileId').textContent = profile.id;
     localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
     if (typeof profile.room === 'string') $('joinCode').value = profile.room;
     return profile;
@@ -548,13 +589,11 @@ function loadProfile() {
 }
 function saveProfile() {
   const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
-  profile.id ||= `user-${crypto.randomUUID().slice(0, 8)}`;
   profile.name = nickname;
   profile.room = roomCode;
   localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
   savedProfile = profile;
   $('profileName').value = nickname;
-  $('profileId').textContent = profile.id;
 }
 $('showTerms').addEventListener('click', () => {
   $('termsStatus').textContent = '';
@@ -590,10 +629,35 @@ $('accessForm').addEventListener('submit', async (event) => {
   }
   $('accessStatus').textContent = 'Signing in…';
   try {
-    const supabaseAccessToken = await signInWithAccount(email, accountPassword);
+    const account = await signInWithAccount(email, accountPassword);
+    supabaseAccessToken = account.access_token;
+    const accountName = typeof account.user?.user_metadata?.display_name === 'string'
+      ? account.user.user_metadata.display_name.trim().slice(0, 40)
+      : '';
+    const localNameBelongsToAccount = !savedProfile.accountId
+      || savedProfile.accountId === account.user?.id;
+    accountDisplayName = accountName;
+    const startingName = accountName || (localNameBelongsToAccount ? savedProfile.name : '') || '';
+    savedProfile.accountId = account.user?.id || '';
+    $('profileName').value = startingName;
+    savedProfile.name = startingName;
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(savedProfile));
+    $('profileSyncStatus').textContent = accountName
+      ? 'Your name is synced to your account.'
+      : startingName
+        ? 'Saving your existing name to your account…'
+        : 'Choose a name and it will sync to your account for other devices.';
+    if (!accountName && startingName) {
+      try {
+        await saveAccountDisplayName(startingName);
+        $('profileSyncStatus').textContent = 'Your name is synced to your account.';
+      } catch (error) {
+        $('profileSyncStatus').textContent = error.message;
+      }
+    }
     const session = await apiRequest('/api/auth/session', {
       method: 'POST',
-      body: JSON.stringify({ supabaseAccessToken })
+      body: JSON.stringify({ supabaseAccessToken: account.access_token })
     }, false);
     apiToken = session.token;
     accessPassword = candidate;
@@ -913,6 +977,12 @@ async function enterRoom(code, name) {
     status('Enter a 6-digit room code and your name.');
     return;
   }
+  try {
+    await saveAccountDisplayName(requestedName);
+    $('profileSyncStatus').textContent = 'Your name is synced to your account.';
+  } catch (error) {
+    $('profileSyncStatus').textContent = error.message;
+  }
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
   renderedMessageIds.clear();
@@ -1042,13 +1112,41 @@ $('profileName').addEventListener('input', () => {
   const name = $('profileName').value.trim();
   if (!name) return;
   const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
-  profile.id ||= `user-${crypto.randomUUID().slice(0, 8)}`;
   profile.name = name;
   localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
   savedProfile = profile;
   if (roomCode) nickname = name;
   $('identity').textContent = roomCode ? `You are ${name}` : '';
-  $('profileId').textContent = profile.id;
+  $('profileSyncStatus').textContent = supabaseAccessToken
+    ? 'Saving your name to your account…'
+    : 'Your name will sync after you sign in.';
+  if (profileSaveTimer) clearTimeout(profileSaveTimer);
+  if (supabaseAccessToken) {
+    profileSaveTimer = setTimeout(() => {
+      profileSaveTimer = null;
+      saveAccountDisplayName(name).then(() => {
+        if ($('profileName').value.trim() === name) {
+          $('profileSyncStatus').textContent = 'Your name is synced to your account.';
+        }
+      }).catch((error) => {
+        if ($('profileName').value.trim() === name) {
+          $('profileSyncStatus').textContent = error.message;
+        }
+      });
+    }, 500);
+  }
+});
+$('profileName').addEventListener('blur', async () => {
+  const name = $('profileName').value.trim();
+  if (!name || !supabaseAccessToken) return;
+  if (profileSaveTimer) clearTimeout(profileSaveTimer);
+  profileSaveTimer = null;
+  try {
+    await saveAccountDisplayName(name);
+    $('profileSyncStatus').textContent = 'Your name is synced to your account.';
+  } catch (error) {
+    $('profileSyncStatus').textContent = error.message;
+  }
 });
 $('send').addEventListener('click', async () => {
   const text = $('plain').value; const secret = accessPassword;
