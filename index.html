@@ -389,8 +389,6 @@ function loadProfile() {
     if (!profile.id) profile.id = `user-${crypto.randomUUID().slice(0, 8)}`;
     if (typeof profile.name !== 'string') profile.name = '';
     $('profileName').value = profile.name;
-    $('createName').value = profile.name;
-    $('joinName').value = profile.name;
     $('profileId').textContent = profile.id;
     localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
     if (typeof profile.room === 'string') $('joinCode').value = profile.room;
@@ -632,10 +630,7 @@ function subscribe() {
 }
 function updateRoomHeading() {
   $('roomTitle').textContent = activeRoomName || `Room ${roomCode}`;
-  $('sidebarName').textContent = activeRoomName || `Room ${roomCode}`;
-  $('sidebarCode').textContent = `Code ${roomCode}`;
   const initial = (activeRoomName || roomCode || 'P').charAt(0).toUpperCase();
-  $('sidebarAvatar').textContent = initial;
   $('headerAvatar').textContent = initial;
 }
 async function enterRoom(code, name) {
@@ -702,7 +697,7 @@ async function enterRoom(code, name) {
 }
 $('createRoom').addEventListener('click', async () => {
   const roomName = $('createRoomName').value.trim();
-  const name = $('createName').value.trim();
+  const name = $('profileName').value.trim();
   if (!roomName || !name) {
     status('Enter a chat name and your display name.');
     return;
@@ -721,7 +716,7 @@ $('createRoom').addEventListener('click', async () => {
     $('createRoom').disabled = false;
   }
 });
-$('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('joinName').value));
+$('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('profileName').value));
 $('editRoomName').addEventListener('click', () => {
   $('roomNameInput').value = activeRoomName;
   $('roomNameStatus').textContent = '';
@@ -770,8 +765,6 @@ $('profileName').addEventListener('input', () => {
   profile.name = name;
   localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
   savedProfile = profile;
-  $('createName').value = name;
-  $('joinName').value = name;
   if (roomCode) nickname = name;
   $('identity').textContent = roomCode ? `You are ${name}` : '';
   $('profileId').textContent = profile.id;
@@ -801,8 +794,6 @@ $('leave').addEventListener('click', () => {
   pollTimer = null; renderedMessageIds.clear(); locallyDeletedMessageIds.clear(); messagesInitialized = false; showingCachedHistory = false; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren();
   $('roomTitle').textContent = '';
   $('roomCode').textContent = '';
-  $('sidebarName').textContent = 'Private room';
-  $('sidebarCode').textContent = 'Encrypted chat';
   savedProfile.room = '';
   localStorage.setItem(PROFILE_KEY, JSON.stringify(savedProfile));
   $('joinCode').value = '';
