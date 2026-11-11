@@ -46,6 +46,14 @@ class ServerApiTests(unittest.TestCase):
             server._sessions.clear()
             server._failed_logins.clear()
         self.saved_message = None
+        self.messages = [{
+            "id": 1,
+            "created_at": "2026-11-10T12:00:00Z",
+            "sender_email": "Test",
+            "receiver_email": "123456",
+            "sender_id": TEST_SENDER_ID,
+            "encrypted_text": "PM3." + "A" * 45,
+        }]
         self.rooms = {}
         self.legacy_room_codes = {"123456"}
         self.members = set()
@@ -89,15 +97,33 @@ class ServerApiTests(unittest.TestCase):
             if method == "GET" and query.get("select") == "id":
                 return []
             if method == "GET":
-                return [{
-                    "id": 1,
-                    "created_at": "2026-11-10T12:00:00Z",
-                    "sender_email": "Test",
-                    "encrypted_text": "PM3." + "A" * 45,
-                }]
+                message_room = query.get("receiver_email", "").removeprefix("eq.")
+                return sorted([
+                    dict(message) for message in self.messages
+                    if message.get("receiver_email") == message_room
+                ], key=lambda message: message["created_at"], reverse=True)
             if method == "POST":
                 self.saved_message = body
+                self.messages.append({
+                    **body,
+                    "id": len(self.messages) + 1,
+                    "created_at": "2026-11-10T12:01:00Z",
+                })
                 return None
+            if method == "DELETE":
+                message_id = query.get("id", "").removeprefix("eq.")
+                message_room = query.get("receiver_email", "").removeprefix("eq.")
+                remaining = []
+                deleted = []
+                for message in self.messages:
+                    matches = (
+                        str(message.get("id")) == message_id
+                        and message.get("receiver_email") == message_room
+                        and message.get("sender_id") == sender_id
+                    )
+                    (deleted if matches else remaining).append(message)
+                self.messages = remaining
+                return [{"id": item["id"]} for item in deleted]
         return None
 
     def request(self, path, method="GET", payload=None, token=None, origin=ORIGIN):
@@ -201,6 +227,7 @@ class ServerApiTests(unittest.TestCase):
         status_code, response = self.request("/api/messages?room=123456", token=token)
         self.assertEqual(status_code, 200)
         self.assertEqual(response["messages"][0]["sender_email"], "Test")
+        self.assertTrue(response["messages"][0]["can_delete"])
         self.assertEqual(response["roomName"], "Room 123456")
 
         status_code, _ = self.request(
@@ -217,6 +244,61 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(status_code, 201)
         self.assertEqual(self.saved_message["sender_id"], TEST_SENDER_ID)
         self.assertNotEqual(self.saved_message["sender_id"], "attacker-controlled-value")
+
+    def test_sender_can_delete_their_message_for_the_room(self):
+        token = self.sign_in()
+        self.join_room(token)
+
+        status_code, payload = self.request(
+            "/api/messages/delete",
+            method="POST",
+            token=token,
+            payload={"roomCode": "123456", "messageId": 1},
+        )
+        self.assertEqual(status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(self.messages, [])
+
+        status_code, response = self.request("/api/messages?room=123456", token=token)
+        self.assertEqual(status_code, 200)
+        self.assertEqual(response["messages"], [])
+
+    def test_sender_cannot_delete_another_members_message(self):
+        token = self.sign_in()
+        self.join_room(token)
+        self.messages[0]["sender_id"] = "another-user"
+
+        status_code, payload = self.request(
+            "/api/messages/delete",
+            method="POST",
+            token=token,
+            payload={"roomCode": "123456", "messageId": 1},
+        )
+        self.assertEqual(status_code, 404)
+        self.assertEqual(len(self.messages), 1)
+
+    def test_message_delete_requires_room_membership(self):
+        token = self.sign_in()
+        status_code, payload = self.request(
+            "/api/messages/delete",
+            method="POST",
+            token=token,
+            payload={"roomCode": "123456", "messageId": 1},
+        )
+        self.assertEqual(status_code, 403)
+        self.assertEqual(len(self.messages), 1)
+
+    def test_message_delete_rejects_invalid_id(self):
+        token = self.sign_in()
+        self.join_room(token)
+        status_code, payload = self.request(
+            "/api/messages/delete",
+            method="POST",
+            token=token,
+            payload={"roomCode": "123456", "messageId": "1,or=gt.0"},
+        )
+        self.assertEqual(status_code, 400)
+        self.assertEqual(len(self.messages), 1)
 
     def test_server_rejects_unencrypted_or_invalid_room_messages(self):
         token = self.sign_in()

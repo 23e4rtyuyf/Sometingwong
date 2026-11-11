@@ -6,6 +6,7 @@ const CHALLENGE_TTL_SECONDS = 90;
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const MAX_BODY_BYTES = 32_000;
 const MAX_MESSAGES = 500;
+const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const encoder = new TextEncoder();
 
 class ApiError extends Error {
@@ -188,6 +189,9 @@ async function supabaseRequest(table, params = {}, options = {}) {
   if (!response.ok) {
     console.error(`[chat-api] Supabase request failed with status ${response.status}.`);
     if (response.status === 401 || response.status === 403) {
+      if (options.method === "DELETE" && table === "messages") {
+        throw new ApiError(502, "Supabase denied message deletion; its existing server permission may not allow DELETE.");
+      }
       throw new ApiError(502, "Chat storage rejected the server configuration.");
     }
     throw new ApiError(502, "Chat storage could not complete the request.");
@@ -515,7 +519,7 @@ async function readMessages(request) {
   await requireRoomMembership(room, session.sender_id);
   const roomInfo = await findRoom(room);
   const messages = await supabaseRequest("messages", {
-    select: "id,created_at,sender_email,encrypted_text",
+    select: "id,created_at,sender_email,encrypted_text,sender_id",
     receiver_email: `eq.${room}`,
     order: "created_at.desc",
     limit: String(MAX_MESSAGES),
@@ -524,7 +528,10 @@ async function readMessages(request) {
     throw new ApiError(502, "Chat storage returned an invalid response.");
   }
   return {
-    messages: messages.reverse(),
+    messages: messages.reverse().map(({ sender_id, ...message }) => ({
+      ...message,
+      can_delete: sender_id === session.sender_id,
+    })),
     roomName: roomInfo?.room_name || `Room ${room}`,
   };
 }
@@ -556,6 +563,39 @@ async function insertMessage(request) {
     prefer: "return=minimal",
   });
   return { ok: true };
+}
+
+async function deleteMessage(request) {
+  const session = await requireSession(request);
+  const body = await readJson(request);
+  const room = body.roomCode;
+  const rawMessageId = body.messageId;
+  const messageId = typeof rawMessageId === "number" && Number.isSafeInteger(rawMessageId)
+    ? String(rawMessageId)
+    : typeof rawMessageId === "string" ? rawMessageId.trim() : "";
+  if (typeof room !== "string" || !/^[0-9]{6}$/.test(room)) {
+    throw new ApiError(400, "Enter a valid 6-digit room code.");
+  }
+  if (!MESSAGE_ID_RE.test(messageId)) {
+    throw new ApiError(400, "Invalid message ID.");
+  }
+  await requireRoomMembership(room, session.sender_id);
+  const deleted = await supabaseRequest("messages", {
+    id: `eq.${messageId}`,
+    receiver_email: `eq.${room}`,
+    sender_id: `eq.${session.sender_id}`,
+    select: "id",
+  }, {
+    method: "DELETE",
+    prefer: "return=representation",
+  });
+  if (!Array.isArray(deleted)) {
+    throw new ApiError(502, "Chat storage returned an invalid deletion response.");
+  }
+  if (deleted.length === 0) {
+    throw new ApiError(404, "Message not found or you cannot delete it.");
+  }
+  return { ok: true, messageId };
 }
 
 async function handle(request) {
@@ -600,6 +640,9 @@ async function handle(request) {
     if (request.method === "POST" && route === "/api/messages") {
       await insertMessage(request);
       return jsonResponse(request, 201, { ok: true });
+    }
+    if (request.method === "POST" && route === "/api/messages/delete") {
+      return jsonResponse(request, 200, await deleteMessage(request));
     }
     throw new ApiError(404, "Not found.");
   } catch (error) {

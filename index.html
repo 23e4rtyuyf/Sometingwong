@@ -48,6 +48,9 @@
     .message.mine { margin-left: auto; background: #d5e7ff; border-radius: 18px 18px 5px 18px; }
     .message-meta { font-size: .75rem; color: #64748b; }
     .message-body { margin-top: .3rem; line-height: 1.4; }
+    .message-actions { display: flex; justify-content: flex-end; margin-top: .45rem; }
+    .message-delete { width: auto; margin: 0; padding: .3rem .65rem; border: 1px solid #efb8b8; border-radius: 8px; background: transparent; color: #a11b1b; font-size: .8rem; }
+    .message-delete:hover { background: #fff1f1; }
     .empty-chat { padding: 4rem 1rem; text-align: center; color: #64748b; }
     .composer { display: flex; gap: .65rem; align-items: flex-end; padding: .9rem 1rem; border-top: 1px solid #dce4f0; background: #fff; }
     .composer textarea { min-height: 48px; max-height: 120px; flex: 1; border-radius: 24px; padding: .8rem 1rem; resize: none; }
@@ -244,6 +247,7 @@ let roomCode = '';
 let nickname = '';
 let pollTimer = null;
 let renderedMessageIds = new Set();
+let locallyDeletedMessageIds = new Set();
 let messagesInitialized = false;
 let showingCachedHistory = false;
 let apiToken = '';
@@ -316,6 +320,19 @@ function cacheEncryptedMessages(code, messages) {
   } catch {
     return false;
   }
+}
+function pruneDeletedMessages(messages) {
+  const currentIds = new Set(messages.map((item) => String(item.id)));
+  let removed = false;
+  for (const row of $('messages').querySelectorAll('.message')) {
+    const messageId = row.dataset.messageId;
+    if (!currentIds.has(messageId)) {
+      row.remove();
+      renderedMessageIds.delete(messageId);
+      removed = true;
+    }
+  }
+  return removed;
 }
 function loadProfile() {
   try {
@@ -450,6 +467,29 @@ function showPage(page) {
   $('chatTab').classList.toggle('active', chat);
   $('classicTab').classList.toggle('active', !chat);
 }
+async function deleteMessage(messageId, row, button) {
+  if (!window.confirm('Delete this message for everyone in the room? This cannot be undone.')) return;
+  const room = roomCode;
+  const id = String(messageId);
+  button.disabled = true;
+  try {
+    await apiRequest('/api/messages/delete', {
+      method: 'POST',
+      body: JSON.stringify({ roomCode: room, messageId })
+    });
+    if (room !== roomCode) return;
+    locallyDeletedMessageIds.add(id);
+    renderedMessageIds.delete(id);
+    row.remove();
+    const cached = readCachedMessages(room).filter((item) => String(item.id) !== id);
+    localHistorySaved = cacheEncryptedMessages(room, cached);
+    await renderMessages([]);
+    status('Message deleted for everyone in this room.');
+  } catch (error) {
+    button.disabled = false;
+    status(error.message || 'Could not delete the message.');
+  }
+}
 async function renderMessages(data) {
   const container = $('messages');
   if (!data.length && renderedMessageIds.size === 0) {
@@ -481,6 +521,18 @@ async function renderMessages(data) {
       output.textContent = 'Message unavailable.';
     }
     row.append(meta, output);
+    if (item.can_delete === true) {
+      const actions = document.createElement('div');
+      actions.className = 'message-actions';
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'message-delete';
+      remove.textContent = 'Delete';
+      remove.setAttribute('aria-label', 'Delete this message for everyone');
+      remove.addEventListener('click', () => deleteMessage(item.id, row, remove));
+      actions.append(remove);
+      row.append(actions);
+    }
     container.append(row);
     appended += 1;
   }
@@ -495,7 +547,7 @@ async function renderMessages(data) {
 }
 async function loadMessages() {
   const result = await apiRequest(`/api/messages?room=${encodeURIComponent(roomCode)}`);
-  const messages = result.messages;
+  const messages = result.messages.filter((item) => !locallyDeletedMessageIds.has(String(item.id)));
   if (typeof result.roomName === 'string' && result.roomName !== activeRoomName) {
     activeRoomName = result.roomName;
     updateRoomHeading();
@@ -507,8 +559,9 @@ async function loadMessages() {
     showingCachedHistory = false;
   }
   const firstLoad = !messagesInitialized;
+  const hasRemovedMessages = pruneDeletedMessages(messages);
   const hasNewMessages = messages.some((item) => !renderedMessageIds.has(String(item.id)));
-  if (!firstLoad && !hasNewMessages) return false;
+  if (!firstLoad && !hasNewMessages && !hasRemovedMessages) return false;
   localHistorySaved = cacheEncryptedMessages(roomCode, messages);
   await renderMessages(messages);
   messagesInitialized = true;
@@ -546,6 +599,7 @@ async function enterRoom(code, name) {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
   renderedMessageIds.clear();
+  locallyDeletedMessageIds.clear();
   messagesInitialized = false;
   showingCachedHistory = false;
   $('messages').replaceChildren();
@@ -695,7 +749,7 @@ $('plain').addEventListener('keydown', (event) => {
 $('refresh').addEventListener('click', async () => { try { await loadMessages(); status('Refreshed.'); } catch (error) { status(error.message); } });
 $('leave').addEventListener('click', () => {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = null; renderedMessageIds.clear(); messagesInitialized = false; showingCachedHistory = false; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren();
+  pollTimer = null; renderedMessageIds.clear(); locallyDeletedMessageIds.clear(); messagesInitialized = false; showingCachedHistory = false; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren();
   $('roomTitle').textContent = '';
   $('roomCode').textContent = '';
   $('sidebarName').textContent = 'Private room';

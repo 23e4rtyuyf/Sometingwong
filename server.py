@@ -28,6 +28,7 @@ MAX_MESSAGES = 500
 ROOM_RE = re.compile(r"^[0-9]{6}$")
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,40}$")
 CIPHERTEXT_RE = re.compile(r"^PM3\.[A-Za-z0-9_-]{40,24000}$")
+MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 PUBLIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -108,6 +109,8 @@ def _supabase_request(path, method="GET", body=None, query=None, prefer="return=
             return json.loads(raw) if raw else None
     except HTTPError as error:
         if error.code in (401, 403):
+            if method == "DELETE" and path.endswith("/messages"):
+                raise ApiError(502, "Supabase denied message deletion; its existing server permission may not allow DELETE.")
             raise ApiError(502, "Chat storage rejected the server configuration.")
         raise ApiError(502, "Chat storage could not complete the request.")
     except (URLError, TimeoutError, OSError, json.JSONDecodeError):
@@ -255,6 +258,9 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages":
                 self._insert_message()
+                return
+            if path == "/api/messages/delete":
+                self._delete_message()
                 return
             raise ApiError(404, "Not found.")
         except ApiError as error:
@@ -448,15 +454,22 @@ class SiteHandler(BaseHTTPRequestHandler):
         self._require_room_membership(session, room)
         room_info = self._find_room(room)
         rows = _supabase_request("/rest/v1/messages", query={
-            "select": "id,created_at,sender_email,encrypted_text",
+            "select": "id,created_at,sender_email,encrypted_text,sender_id",
             "receiver_email": f"eq.{room}",
             "order": "created_at.desc",
             "limit": str(MAX_MESSAGES),
         })
         if not isinstance(rows, list):
             raise ApiError(502, "Chat storage returned an invalid response.")
+        messages = [
+            {
+                **{key: value for key, value in row.items() if key != "sender_id"},
+                "can_delete": row.get("sender_id") == session["sender_id"],
+            }
+            for row in reversed(rows)
+        ]
         self._send_json(200, {
-            "messages": list(reversed(rows)),
+            "messages": messages,
             "roomName": room_info["room_name"] if room_info else f"Room {room}",
         })
 
@@ -484,6 +497,33 @@ class SiteHandler(BaseHTTPRequestHandler):
             },
         )
         self._send_json(201, {"ok": True})
+
+    def _delete_message(self):
+        session = self._require_session()
+        body = self._read_body()
+        room = body.get("roomCode")
+        message_id = body.get("messageId")
+        if not isinstance(room, str) or not ROOM_RE.fullmatch(room):
+            raise ApiError(400, "Enter a valid 6-digit room code.")
+        if isinstance(message_id, bool) or not MESSAGE_ID_RE.fullmatch(str(message_id or "")):
+            raise ApiError(400, "Invalid message ID.")
+        self._require_room_membership(session, room)
+        deleted = _supabase_request(
+            "/rest/v1/messages",
+            method="DELETE",
+            query={
+                "id": f"eq.{message_id}",
+                "receiver_email": f"eq.{room}",
+                "sender_id": f"eq.{session['sender_id']}",
+                "select": "id",
+            },
+            prefer="return=representation",
+        )
+        if not isinstance(deleted, list):
+            raise ApiError(502, "Chat storage returned an invalid deletion response.")
+        if not deleted:
+            raise ApiError(404, "Message not found or you cannot delete it.")
+        self._send_json(200, {"ok": True, "messageId": str(message_id)})
 
 
 if __name__ == "__main__":
