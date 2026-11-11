@@ -9,6 +9,7 @@ import re
 import secrets
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -25,6 +26,8 @@ CHALLENGE_TTL = 90
 SESSION_TTL = 8 * 60 * 60
 MAX_BODY_BYTES = 32_000
 MAX_MESSAGES = 500
+IDENTITY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+CURSOR_TIMESTAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$")
 ROOM_RE = re.compile(r"^[0-9]{6}$")
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,40}$")
 CIPHERTEXT_RE = re.compile(r"^PM3\.[A-Za-z0-9_-]{40,24000}$")
@@ -46,6 +49,7 @@ PUBLIC_FILES = {
 _lock = threading.RLock()
 _challenges = {}
 _sessions = {}
+_identities = {}
 _failed_logins = {}
 
 
@@ -328,8 +332,14 @@ class SiteHandler(BaseHTTPRequestHandler):
         request = self._read_body()
         challenge_id = request.get("challengeId")
         proof = request.get("proof")
+        identity_token = request.get("identityToken")
+        previous_token = request.get("previousToken")
         if not isinstance(challenge_id, str) or not isinstance(proof, str):
             raise ApiError(400, "Invalid sign-in proof.")
+        if identity_token is not None and (
+            not isinstance(identity_token, str) or not IDENTITY_TOKEN_RE.fullmatch(identity_token)
+        ):
+            raise ApiError(400, "Invalid local chat identity.")
         with _lock:
             challenge = _challenges.pop(challenge_id, None)
         if not challenge or challenge["expires"] <= time.time() or challenge["address"] != self.client_address[0]:
@@ -344,7 +354,20 @@ class SiteHandler(BaseHTTPRequestHandler):
                 _failed_logins.setdefault(challenge["address"], []).append(time.time())
             raise ApiError(401, "Incorrect access password.")
 
-        sender_id = _create_anonymous_user()
+        sender_id = None
+        identity_key = _session_key(f"identity:{identity_token}") if identity_token else None
+        with _lock:
+            if identity_key:
+                sender_id = _identities.get(identity_key)
+            if not sender_id and isinstance(previous_token, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", previous_token):
+                previous = _sessions.get(_session_key(previous_token))
+                if previous:
+                    sender_id = previous["sender_id"]
+        if not sender_id:
+            sender_id = _create_anonymous_user()
+        if identity_key:
+            with _lock:
+                sender_id = _identities.setdefault(identity_key, sender_id)
         token = secrets.token_urlsafe(32)
         session_key = _session_key(token)
         expires = time.time() + SESSION_TTL
@@ -451,16 +474,38 @@ class SiteHandler(BaseHTTPRequestHandler):
         room = room_values[0] if len(room_values) == 1 else ""
         if not ROOM_RE.fullmatch(room):
             raise ApiError(400, "Enter a valid 6-digit room code.")
+        cursor_times = query.get("beforeCreatedAt", [])
+        cursor_ids = query.get("beforeId", [])
+        before_created_at = cursor_times[0] if len(cursor_times) == 1 else ""
+        before_id = cursor_ids[0] if len(cursor_ids) == 1 else ""
+        if bool(before_created_at) != bool(before_id):
+            raise ApiError(400, "Invalid older-message cursor.")
+        if before_created_at:
+            if (len(before_created_at) > 40 or not CURSOR_TIMESTAMP_RE.fullmatch(before_created_at)
+                or not MESSAGE_ID_RE.fullmatch(before_id)):
+                raise ApiError(400, "Invalid older-message cursor.")
+            try:
+                datetime.fromisoformat(before_created_at.replace("Z", "+00:00"))
+            except ValueError:
+                raise ApiError(400, "Invalid older-message cursor.")
         self._require_room_membership(session, room)
         room_info = self._find_room(room)
-        rows = _supabase_request("/rest/v1/messages", query={
+        message_query = {
             "select": "id,created_at,sender_email,encrypted_text,sender_id",
             "receiver_email": f"eq.{room}",
-            "order": "created_at.desc",
-            "limit": str(MAX_MESSAGES),
-        })
+            "order": "created_at.desc,id.desc",
+            "limit": str(MAX_MESSAGES + 1),
+        }
+        if before_created_at:
+            message_query["or"] = (
+                f"(created_at.lt.{before_created_at},"
+                f"and(created_at.eq.{before_created_at},id.lt.{before_id}))"
+            )
+        rows = _supabase_request("/rest/v1/messages", query=message_query)
         if not isinstance(rows, list):
             raise ApiError(502, "Chat storage returned an invalid response.")
+        has_more = len(rows) > MAX_MESSAGES
+        rows = rows[:MAX_MESSAGES]
         messages = [
             {
                 **{key: value for key, value in row.items() if key != "sender_id"},
@@ -471,6 +516,7 @@ class SiteHandler(BaseHTTPRequestHandler):
         self._send_json(200, {
             "messages": messages,
             "roomName": room_info["room_name"] if room_info else f"Room {room}",
+            "hasMore": has_more,
         })
 
     def _insert_message(self):

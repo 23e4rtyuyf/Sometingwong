@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import threading
 import time
 import unittest
@@ -44,6 +45,7 @@ class ServerApiTests(unittest.TestCase):
         with server._lock:
             server._challenges.clear()
             server._sessions.clear()
+            server._identities.clear()
             server._failed_logins.clear()
         self.saved_message = None
         self.messages = [{
@@ -58,11 +60,11 @@ class ServerApiTests(unittest.TestCase):
         self.legacy_room_codes = {"123456"}
         self.members = set()
         self.supabase = patch.object(server, "_supabase_request", side_effect=self.fake_supabase)
-        self.auth_user = patch.object(server, "_create_anonymous_user", return_value=TEST_SENDER_ID)
+        self.auth_user_patch = patch.object(server, "_create_anonymous_user", return_value=TEST_SENDER_ID)
         self.supabase.start()
-        self.auth_user.start()
+        self.auth_user = self.auth_user_patch.start()
         self.addCleanup(self.supabase.stop)
-        self.addCleanup(self.auth_user.stop)
+        self.addCleanup(self.auth_user_patch.stop)
 
     def fake_supabase(self, path, method="GET", body=None, query=None, prefer="return=minimal"):
         query = query or {}
@@ -98,10 +100,25 @@ class ServerApiTests(unittest.TestCase):
                 return []
             if method == "GET":
                 message_room = query.get("receiver_email", "").removeprefix("eq.")
-                return sorted([
+                rows = sorted([
                     dict(message) for message in self.messages
                     if message.get("receiver_email") == message_room
-                ], key=lambda message: message["created_at"], reverse=True)
+                ], key=lambda message: (message["created_at"], str(message["id"])), reverse=True)
+                cursor = query.get("or", "")
+                if cursor:
+                    match = re.fullmatch(
+                        r"\(created_at\.lt\.(.*?),and\(created_at\.eq\.(.*?),id\.lt\.(.*?)\)\)",
+                        cursor,
+                    )
+                    if match:
+                        before_time, _, before_id = match.groups()
+                        rows = [
+                            message for message in rows
+                            if message["created_at"] < before_time
+                            or (message["created_at"] == before_time
+                                and str(message["id"]) < before_id)
+                        ]
+                return rows[:int(query.get("limit", server.MAX_MESSAGES))]
             if method == "POST":
                 self.saved_message = body
                 self.messages.append({
@@ -141,7 +158,7 @@ class ServerApiTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read() or b"{}")
 
-    def sign_in(self):
+    def sign_in(self, identity_token="A" * 43):
         status_code, challenge = self.request("/api/auth/challenge")
         self.assertEqual(status_code, 200)
         nonce = challenge["nonce"]
@@ -154,7 +171,11 @@ class ServerApiTests(unittest.TestCase):
         status_code, session = self.request(
             "/api/auth/verify",
             method="POST",
-            payload={"challengeId": challenge["challengeId"], "proof": proof},
+            payload={
+                "challengeId": challenge["challengeId"],
+                "proof": proof,
+                "identityToken": identity_token,
+            },
         )
         self.assertEqual(status_code, 200)
         return session["token"]
@@ -218,6 +239,52 @@ class ServerApiTests(unittest.TestCase):
         status_code, payload = self.request("/api/messages?room=123456", token=token)
         self.assertEqual(status_code, 401)
         self.assertIn("expired", payload["error"])
+
+    def test_sign_in_reuses_the_same_device_identity(self):
+        self.auth_user.side_effect = [
+            TEST_SENDER_ID,
+            "7f2af4b4-12a3-4f1f-a910-6e8769fa05cd",
+        ]
+        first_token = self.sign_in()
+        second_token = self.sign_in()
+
+        with server._lock:
+            first_sender = server._sessions[server._session_key(first_token)]["sender_id"]
+            second_sender = server._sessions[server._session_key(second_token)]["sender_id"]
+        self.assertNotEqual(first_token, second_token)
+        self.assertEqual(first_sender, TEST_SENDER_ID)
+        self.assertEqual(second_sender, TEST_SENDER_ID)
+
+    def test_message_history_uses_stable_pages(self):
+        token = self.sign_in()
+        self.join_room(token)
+        self.messages = [
+            {
+                "id": index,
+                "created_at": f"2026-11-10T12:{index // 60:02d}:{index % 60:02d}Z",
+                "sender_email": "Test",
+                "receiver_email": "123456",
+                "sender_id": TEST_SENDER_ID,
+                "encrypted_text": "PM3." + "A" * 45,
+            }
+            for index in range(server.MAX_MESSAGES + 1)
+        ]
+
+        status_code, newest_page = self.request("/api/messages?room=123456", token=token)
+        self.assertEqual(status_code, 200)
+        self.assertEqual(len(newest_page["messages"]), server.MAX_MESSAGES)
+        self.assertTrue(newest_page["hasMore"])
+
+        oldest = newest_page["messages"][0]
+        cursor_path = (
+            f"/api/messages?room=123456&beforeCreatedAt={oldest['created_at']}"
+            f"&beforeId={oldest['id']}"
+        )
+        status_code, older_page = self.request(cursor_path, token=token)
+        self.assertEqual(status_code, 200)
+        self.assertFalse(older_page["hasMore"])
+        self.assertEqual(len(older_page["messages"]), 1)
+        self.assertLess(older_page["messages"][0]["created_at"], oldest["created_at"])
 
     def test_authenticated_chat_read_and_write_use_server_identity(self):
         token = self.sign_in()

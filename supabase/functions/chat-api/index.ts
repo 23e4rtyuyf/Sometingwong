@@ -7,6 +7,7 @@ const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const MAX_BODY_BYTES = 32_000;
 const MAX_MESSAGES = 500;
 const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const IDENTITY_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const encoder = new TextEncoder();
 
 class ApiError extends Error {
@@ -325,15 +326,31 @@ async function createAnonymousUser() {
   return userId;
 }
 
+async function storedSessionForToken(token) {
+  const settings = config();
+  const tokenHash = await hashForStorage(settings.sessionSecret, token);
+  const rows = await supabaseRequest("chat_api_sessions", {
+    select: "sender_id,expires_at",
+    token_hash: `eq.${tokenHash}`,
+    limit: "1",
+  });
+  return Array.isArray(rows) ? rows[0] || null : null;
+}
+
 async function verifyChallenge(request) {
   const settings = config();
   const body = await readJson(request);
   const challengeId = body.challengeId;
   const proof = body.proof;
+  const identityToken = typeof body.identityToken === "string" ? body.identityToken : "";
+  const previousToken = typeof body.previousToken === "string" ? body.previousToken : "";
   if (typeof challengeId !== "string"
     || !/^[A-Za-z0-9_-]{32}$/.test(challengeId)
     || typeof proof !== "string") {
     throw new ApiError(400, "Invalid sign-in proof.");
+  }
+  if (identityToken && !IDENTITY_TOKEN_RE.test(identityToken)) {
+    throw new ApiError(400, "Invalid local chat identity.");
   }
   const addressHash = await hashForStorage(settings.sessionSecret, clientAddress(request));
   const challenges = await supabaseRequest("chat_api_challenges", {
@@ -367,7 +384,44 @@ async function verifyChallenge(request) {
     });
     throw new ApiError(401, "Incorrect access password.");
   }
-  const senderId = await createAnonymousUser();
+  let senderId = "";
+  if (identityToken) {
+    const identityRecord = await storedSessionForToken(identityToken);
+    if (identityRecord && typeof identityRecord.sender_id === "string") {
+      senderId = identityRecord.sender_id;
+    } else {
+      if (/^[A-Za-z0-9_-]{1,128}$/.test(previousToken)) {
+        const previousRecord = await storedSessionForToken(previousToken);
+        const previousExpiry = Date.parse(previousRecord?.expires_at || "");
+        const maxSessionExpiry = Date.now() + (SESSION_TTL_SECONDS + 60) * 1000;
+        if (previousRecord && Number.isFinite(previousExpiry) && previousExpiry <= maxSessionExpiry) {
+          senderId = previousRecord.sender_id;
+        }
+      }
+      if (!senderId) senderId = await createAnonymousUser();
+      const identityHash = await hashForStorage(settings.sessionSecret, identityToken);
+      // Keep a device-to-sender mapping in the existing table; requireSession
+      // rejects far-future rows so this identity token cannot act as an API session.
+      await supabaseRequest("chat_api_sessions", {
+        on_conflict: "token_hash",
+      }, {
+        method: "POST",
+        body: {
+          token_hash: identityHash,
+          sender_id: senderId,
+          expires_at: "9999-12-31T23:59:59.999Z",
+        },
+        prefer: "resolution=ignore-duplicates,return=minimal",
+      });
+      const stableRecord = await storedSessionForToken(identityToken);
+      if (!stableRecord || typeof stableRecord.sender_id !== "string") {
+        throw new ApiError(503, "Could not save this device's chat identity.");
+      }
+      senderId = stableRecord.sender_id;
+    }
+  } else {
+    senderId = await createAnonymousUser();
+  }
   const token = encodeBase64Url(randomBytes(32));
   const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
   const tokenHash = await hashForStorage(settings.sessionSecret, token);
@@ -389,13 +443,17 @@ async function requireSession(request) {
   if (!match) throw new ApiError(401, "Sign in to continue.");
   const tokenHash = await hashForStorage(settings.sessionSecret, match[1]);
   const rows = await supabaseRequest("chat_api_sessions", {
-    select: "sender_id",
+    select: "sender_id,expires_at",
     token_hash: `eq.${tokenHash}`,
     expires_at: `gt.${new Date().toISOString()}`,
     limit: "1",
   });
   const session = Array.isArray(rows) ? rows[0] : null;
-  if (!session) throw new ApiError(401, "Your session expired. Sign in again.");
+  const expiresAt = Date.parse(session?.expires_at || "");
+  const maximumSessionExpiry = Date.now() + (SESSION_TTL_SECONDS + 60) * 1000;
+  if (!session || !Number.isFinite(expiresAt) || expiresAt > maximumSessionExpiry) {
+    throw new ApiError(401, "Your session expired. Sign in again.");
+  }
   return session;
 }
 
@@ -518,21 +576,37 @@ async function readMessages(request) {
   }
   await requireRoomMembership(room, session.sender_id);
   const roomInfo = await findRoom(room);
-  const messages = await supabaseRequest("messages", {
+  const beforeCreatedAt = url.searchParams.get("beforeCreatedAt");
+  const beforeId = url.searchParams.get("beforeId");
+  if (Boolean(beforeCreatedAt) !== Boolean(beforeId)
+    || (beforeCreatedAt && (beforeCreatedAt.length > 40 || !Number.isFinite(Date.parse(beforeCreatedAt))
+      || !MESSAGE_ID_RE.test(beforeId)))) {
+    throw new ApiError(400, "Invalid older-message cursor.");
+  }
+  const query = {
     select: "id,created_at,sender_email,encrypted_text,sender_id",
     receiver_email: `eq.${room}`,
-    order: "created_at.desc",
-    limit: String(MAX_MESSAGES),
+    order: "created_at.desc,id.desc",
+    limit: String(MAX_MESSAGES + 1),
+    ...(beforeCreatedAt ? {
+      or: `(created_at.lt.${beforeCreatedAt},and(created_at.eq.${beforeCreatedAt},id.lt.${beforeId}))`,
+    } : {}),
+  };
+  const messages = await supabaseRequest("messages", {
+    ...query,
   });
   if (!Array.isArray(messages)) {
     throw new ApiError(502, "Chat storage returned an invalid response.");
   }
+  const hasMore = messages.length > MAX_MESSAGES;
+  const page = messages.slice(0, MAX_MESSAGES);
   return {
-    messages: messages.reverse().map(({ sender_id, ...message }) => ({
+    messages: page.reverse().map(({ sender_id, ...message }) => ({
       ...message,
       can_delete: sender_id === session.sender_id,
     })),
     roomName: roomInfo?.room_name || `Room ${room}`,
+    hasMore,
   };
 }
 

@@ -70,6 +70,9 @@
     .menu-items button.danger { color:#a11b1b; }
     .chat-tools { display:flex; align-items:center; padding:.45rem 1.15rem; border-bottom:1px solid #e8edf5; background:#f8fafd; }
     .chat-tools .small { margin:0; }
+    .history-button { display:block; width:auto; margin:.65rem auto 0; padding:.45rem .85rem; background:#e8eef8; color:#26354b; font-size:.88rem; }
+    .history-button:hover { background:#dce7f6; }
+    .history-button[hidden] { display:none; }
     #messages { flex:1; min-height:300px; max-height:55vh; overflow-y:auto; padding:1rem clamp(.8rem,3vw,1.5rem); background:#fff; }
     .message { display:flex; flex-direction:column; max-width:min(76%,560px); margin:.7rem 0; padding:.65rem .85rem; background:#f1f3f6; border-radius:17px 17px 17px 5px; }
     .message.mine { margin-left:auto; background:var(--bubble); border-radius:17px 17px 5px 17px; }
@@ -265,8 +268,9 @@
           </details>
         </header>
         <div class="chat-tools">
-          <span class="small">Messages refresh automatically · Encrypted on this device</span>
+          <span id="historyStatus" class="small">Messages refresh automatically · Encrypted on this device</span>
         </div>
+        <button id="loadOlder" class="history-button" type="button" hidden>Load earlier messages</button>
         <div id="messages" role="log" aria-label="Chat messages" aria-live="polite" aria-relevant="additions text"></div>
         <div class="composer">
           <textarea id="plain" aria-label="Type a message" placeholder="Write a message…" rows="1"></textarea>
@@ -285,10 +289,15 @@ const API_BASE_URL = (window.CHAT_API_BASE_URL || '').replace(/\/+$/, '');
 const AUTH_ITERATIONS = 600000;
 const AUTH_SALT = 'private-live-chat-auth-v1';
 const PROFILE_KEY = 'private-chat-profile-v1';
+const IDENTITY_TOKEN_KEY = 'private-chat-identity-v1';
+const API_SESSION_KEY = 'private-chat-api-session-v1';
 const MESSAGE_CACHE_PREFIX = 'private-chat-encrypted-history-v1:';
-const MAX_CACHED_MESSAGES = 100;
+const HISTORY_COMPLETE_PREFIX = 'private-chat-history-complete-v2:';
 const MAX_DISPLAYED_MESSAGES = 500;
-const MAX_CACHE_CHARS = 750000;
+const HISTORY_DB_NAME = 'private-chat-history-v2';
+const HISTORY_STORE = 'messages';
+const HISTORY_UI_PAGE_SIZE = 100;
+const SERVER_PAGE_SIZE = 500;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const $ = (id) => document.getElementById(id);
@@ -305,8 +314,24 @@ let activeRoomName = '';
 let termsAccepted = false;
 let savedProfile = {};
 let localHistorySaved = false;
+let historyBackfillRoom = '';
+let serverHasOlder = false;
+let olderMessagesLoading = false;
+let historyDbPromise = null;
 
 function status(message) { $('status').textContent = message; }
+function savedSessionToken() {
+  try { return sessionStorage.getItem(API_SESSION_KEY) || ''; }
+  catch { return ''; }
+}
+function getOrCreateIdentityToken() {
+  let token = localStorage.getItem(IDENTITY_TOKEN_KEY) || '';
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
+    token = b64(crypto.getRandomValues(new Uint8Array(32)));
+    localStorage.setItem(IDENTITY_TOKEN_KEY, token);
+  }
+  return token;
+}
 function lockForExpiredSession() {
   if (!apiToken) return;
   apiToken = '';
@@ -337,51 +362,158 @@ async function apiRequest(path, options = {}, includeAuth = true) {
   }
   return payload;
 }
-function readCachedMessages(code) {
-  try {
-    const messages = JSON.parse(localStorage.getItem(`${MESSAGE_CACHE_PREFIX}${code}`) || '[]');
-    if (!Array.isArray(messages)) return [];
-    return messages.filter((item) => item && (typeof item.id === 'string' || typeof item.id === 'number')
-      && typeof item.created_at === 'string' && typeof item.sender_email === 'string'
-      && typeof item.encrypted_text === 'string');
-  } catch {
-    return [];
+function openHistoryDatabase() {
+  if (!window.indexedDB) return Promise.reject(new Error('This browser does not support local chat history.'));
+  if (!historyDbPromise) {
+    historyDbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(HISTORY_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(HISTORY_STORE)) {
+          const store = db.createObjectStore(HISTORY_STORE, { keyPath: 'cacheKey' });
+          store.createIndex('roomCode', 'roomCode', { unique: false });
+        }
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        db.onversionchange = () => {
+          db.close();
+          historyDbPromise = null;
+        };
+        resolve(db);
+      };
+      request.onerror = () => {
+        historyDbPromise = null;
+        reject(new Error('Could not open local chat history storage.'));
+      };
+      request.onblocked = () => {
+        historyDbPromise = null;
+        reject(new Error('Close other Private Messages tabs to open local chat history.'));
+      };
+    });
   }
+  return historyDbPromise;
 }
-function cacheEncryptedMessages(code, messages) {
-  let retained = messages.filter((item) => item && typeof item.created_at === 'string'
-    && typeof item.sender_email === 'string' && typeof item.encrypted_text === 'string')
-    .map((item) => ({
-      id: item.id,
-      created_at: item.created_at,
-      sender_email: item.sender_email,
-      encrypted_text: item.encrypted_text
-    })).slice(-MAX_CACHED_MESSAGES);
-  let serialized = JSON.stringify(retained);
-  while (retained.length > 1 && serialized.length > MAX_CACHE_CHARS) {
-    retained.shift();
-    serialized = JSON.stringify(retained);
-  }
-  if (serialized.length > MAX_CACHE_CHARS) return false;
+function validCachedMessage(item) {
+  return item && (typeof item.id === 'string' || typeof item.id === 'number')
+    && typeof item.created_at === 'string' && typeof item.sender_email === 'string'
+    && typeof item.encrypted_text === 'string';
+}
+function compareMessages(left, right) {
+  const timeDifference = Date.parse(left.created_at) - Date.parse(right.created_at);
+  if (timeDifference) return timeDifference;
+  return String(left.id).localeCompare(String(right.id), undefined, { numeric: true });
+}
+async function cacheEncryptedMessages(code, messages) {
+  const retained = messages.filter(validCachedMessage).map((item) => ({
+    cacheKey: `${code}:${String(item.id)}`,
+    roomCode: code,
+    id: String(item.id),
+    created_at: item.created_at,
+    sender_email: item.sender_email,
+    encrypted_text: item.encrypted_text,
+    can_delete: item.can_delete === true,
+  }));
+  if (!retained.length) return true;
   try {
-    localStorage.setItem(`${MESSAGE_CACHE_PREFIX}${code}`, serialized);
+    const db = await openHistoryDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(HISTORY_STORE, 'readwrite');
+      const store = transaction.objectStore(HISTORY_STORE);
+      for (const item of retained) store.put(item);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(new Error('Could not save all chat history on this device.'));
+      transaction.onabort = () => reject(new Error('Could not save all chat history on this device.'));
+    });
     return true;
   } catch {
     return false;
   }
 }
-function pruneDeletedMessages(messages) {
+async function readCachedMessages(code) {
+  try {
+    const legacyKey = `${MESSAGE_CACHE_PREFIX}${code}`;
+    const legacyRaw = localStorage.getItem(legacyKey);
+    if (legacyRaw) {
+      let legacyMessages = [];
+      try {
+        const parsed = JSON.parse(legacyRaw);
+        if (Array.isArray(parsed)) legacyMessages = parsed.filter(validCachedMessage);
+      } catch { /* Leave invalid old cache untouched for recovery. */ }
+      if (legacyMessages.length && !(await cacheEncryptedMessages(code, legacyMessages))) {
+        throw new Error('Could not move saved chat history into local storage.');
+      }
+      if (legacyMessages.length) localStorage.removeItem(legacyKey);
+    }
+    const db = await openHistoryDatabase();
+    const records = await new Promise((resolve, reject) => {
+      const transaction = db.transaction(HISTORY_STORE, 'readonly');
+      const request = transaction.objectStore(HISTORY_STORE).index('roomCode').getAll(code);
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(new Error('Could not read local chat history.'));
+      transaction.onabort = () => reject(new Error('Could not read local chat history.'));
+    });
+    return records.filter(validCachedMessage).sort(compareMessages);
+  } catch (error) {
+    status(error.message || 'Could not read local chat history.');
+    return [];
+  }
+}
+async function deleteCachedMessage(code, messageId) {
+  try {
+    const db = await openHistoryDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(HISTORY_STORE, 'readwrite');
+      transaction.objectStore(HISTORY_STORE).delete(`${code}:${String(messageId)}`);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(new Error('Could not update local chat history.'));
+      transaction.onabort = () => reject(new Error('Could not update local chat history.'));
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function removeCachedMessagesNotIn(code, serverIds) {
+  try {
+    const db = await openHistoryDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(HISTORY_STORE, 'readwrite');
+      const store = transaction.objectStore(HISTORY_STORE);
+      const request = store.index('roomCode').getAll(code);
+      request.onsuccess = () => {
+        for (const record of request.result || []) {
+          if (!serverIds.has(String(record.id))) store.delete(record.cacheKey);
+        }
+      };
+      request.onerror = () => reject(new Error('Could not reconcile saved chat history.'));
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(new Error('Could not reconcile saved chat history.'));
+      transaction.onabort = () => reject(new Error('Could not reconcile saved chat history.'));
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function pruneDeletedMessages(messages) {
   const currentIds = new Set(messages.map((item) => String(item.id)));
-  let removed = false;
+  const newestPageBoundary = messages[0] || null;
+  const removedIds = [];
   for (const row of $('messages').querySelectorAll('.message')) {
     const messageId = row.dataset.messageId;
-    if (!currentIds.has(messageId)) {
+    const messageTime = { id: messageId, created_at: row.dataset.createdAt };
+    if ((!newestPageBoundary || compareMessages(messageTime, newestPageBoundary) >= 0)
+      && !currentIds.has(messageId)) {
       row.remove();
       renderedMessageIds.delete(messageId);
-      removed = true;
+      removedIds.push(messageId);
     }
   }
-  return removed;
+  for (const messageId of removedIds) {
+    await deleteCachedMessage(roomCode, messageId);
+  }
+  return removedIds.length > 0;
 }
 function loadProfile() {
   try {
@@ -450,11 +582,18 @@ $('accessForm').addEventListener('submit', async (event) => {
   try {
     const challenge = await apiRequest('/api/auth/challenge', { method: 'GET' }, false);
     const proof = await passwordProof(candidate, unb64(challenge.nonce));
+    const identityToken = getOrCreateIdentityToken();
     const session = await apiRequest('/api/auth/verify', {
       method: 'POST',
-      body: JSON.stringify({ challengeId: challenge.challengeId, proof })
+      body: JSON.stringify({
+        challengeId: challenge.challengeId,
+        proof,
+        identityToken,
+        previousToken: savedSessionToken(),
+      })
     }, false);
     apiToken = session.token;
+    try { sessionStorage.setItem(API_SESSION_KEY, apiToken); } catch { /* The stable identity token remains in local storage. */ }
     encryptionSecret = candidate;
     $('accessPassword').value = '';
     $('accessStatus').textContent = '';
@@ -528,16 +667,16 @@ async function deleteMessage(messageId, row, button) {
     locallyDeletedMessageIds.add(id);
     renderedMessageIds.delete(id);
     row.remove();
-    const cached = readCachedMessages(room).filter((item) => String(item.id) !== id);
-    localHistorySaved = cacheEncryptedMessages(room, cached);
+    localHistorySaved = await deleteCachedMessage(room, id);
     await renderMessages([]);
+    await updateLoadOlderButton();
     status('Message deleted for everyone in this room.');
   } catch (error) {
     button.disabled = false;
     status(error.message || 'Could not delete the message.');
   }
 }
-async function renderMessages(data) {
+async function renderMessages(data, options = {}) {
   const container = $('messages');
   if (!data.length && renderedMessageIds.size === 0) {
     if (!container.querySelector('.empty-chat')) {
@@ -548,6 +687,9 @@ async function renderMessages(data) {
     }
     return 0;
   }
+  const prepend = options.prepend === true;
+  const oldScrollHeight = container.scrollHeight;
+  const oldFirstMessage = container.querySelector('.message');
   const wasNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 48;
   container.querySelector('.empty-chat')?.remove();
   let appended = 0;
@@ -557,6 +699,7 @@ async function renderMessages(data) {
     renderedMessageIds.add(messageId);
     const row = document.createElement('div');
     row.dataset.messageId = messageId;
+    row.dataset.createdAt = item.created_at;
     row.className = `message${item.sender_email === nickname ? ' mine' : ''}`;
     const meta = document.createElement('div'); meta.className = 'message-meta';
     meta.textContent = `${item.sender_email} · ${new Date(item.created_at).toLocaleString()}`;
@@ -580,21 +723,20 @@ async function renderMessages(data) {
       actions.append(remove);
       row.append(actions);
     }
-    container.append(row);
+    if (prepend && oldFirstMessage) container.insertBefore(row, oldFirstMessage);
+    else container.append(row);
     appended += 1;
   }
-  while (container.querySelectorAll('.message').length > MAX_DISPLAYED_MESSAGES) {
-    const oldest = container.querySelector('.message');
-    if (!oldest) break;
-    renderedMessageIds.delete(oldest.dataset.messageId);
-    oldest.remove();
-  }
-  if (appended && wasNearBottom) container.scrollTop = container.scrollHeight;
+  if (prepend && appended) container.scrollTop += container.scrollHeight - oldScrollHeight;
+  else if (appended && wasNearBottom) container.scrollTop = container.scrollHeight;
   return appended;
 }
 async function loadMessages() {
-  const result = await apiRequest(`/api/messages?room=${encodeURIComponent(roomCode)}`);
+  const room = roomCode;
+  const result = await apiRequest(messagePageUrl(room));
   const messages = result.messages.filter((item) => !locallyDeletedMessageIds.has(String(item.id)));
+  const pageHasMore = result.hasMore === true;
+  serverHasOlder = result.hasMore === true;
   if (typeof result.roomName === 'string' && result.roomName !== activeRoomName) {
     activeRoomName = result.roomName;
     updateRoomHeading();
@@ -606,13 +748,140 @@ async function loadMessages() {
     showingCachedHistory = false;
   }
   const firstLoad = !messagesInitialized;
-  const hasRemovedMessages = pruneDeletedMessages(messages);
+  const hasRemovedMessages = await pruneDeletedMessages(messages);
   const hasNewMessages = messages.some((item) => !renderedMessageIds.has(String(item.id)));
   if (!firstLoad && !hasNewMessages && !hasRemovedMessages) return false;
-  localHistorySaved = cacheEncryptedMessages(roomCode, messages);
+  localHistorySaved = await cacheEncryptedMessages(room, messages);
   await renderMessages(messages);
   messagesInitialized = true;
+  await updateLoadOlderButton();
+  if (pageHasMore && historyBackfillRoom !== room) {
+    historyBackfillRoom = room;
+    void backfillOlderHistory(room, messages).catch(() => {});
+  } else if (!pageHasMore && firstLoad) {
+    if (!(await removeCachedMessagesNotIn(
+      room,
+      new Set(messages.map((item) => String(item.id))),
+    ))) {
+      localHistorySaved = false;
+    }
+    try { localStorage.setItem(`${HISTORY_COMPLETE_PREFIX}${room}`, 'true'); } catch { /* IndexedDB still retains the messages. */ }
+    $('historyStatus').textContent = localHistorySaved
+      ? 'All encrypted chat history is saved on this device.'
+      : 'This browser could not save chat history locally.';
+  }
   return !firstLoad && hasNewMessages;
+}
+function messagePageUrl(room, cursor = null) {
+  const params = new URLSearchParams({ room });
+  if (cursor) {
+    params.set('beforeCreatedAt', cursor.created_at);
+    params.set('beforeId', String(cursor.id));
+  }
+  return `/api/messages?${params.toString()}`;
+}
+async function backfillOlderHistory(room, firstPage) {
+  try {
+    const cached = await readCachedMessages(room);
+    if (roomCode !== room || !firstPage.length) return;
+    let wasComplete = false;
+    try { wasComplete = cached.length > 0 && localStorage.getItem(`${HISTORY_COMPLETE_PREFIX}${room}`) === 'true'; }
+    catch { wasComplete = false; }
+    const serverIds = new Set(firstPage.map((item) => String(item.id)));
+    let cursor = firstPage[0];
+    const knownNewest = wasComplete ? cached[cached.length - 1] : null;
+    let more = serverHasOlder && (!knownNewest || compareMessages(cursor, knownNewest) > 0);
+    $('historyStatus').textContent = 'Saving older messages on this device…';
+    while (roomCode === room && more) {
+      const result = await apiRequest(messagePageUrl(room, cursor));
+      const page = Array.isArray(result.messages) ? result.messages : [];
+      if (!page.length) {
+        more = false;
+        break;
+      }
+      const nextCursor = page[0];
+      if (compareMessages(nextCursor, cursor) >= 0) {
+        more = false;
+        break;
+      }
+      if (!(await cacheEncryptedMessages(room, page))) {
+        throw new Error('Could not save all chat history on this device.');
+      }
+      for (const item of page) serverIds.add(String(item.id));
+      cursor = nextCursor;
+      more = result.hasMore === true;
+      serverHasOlder = more;
+      if (knownNewest && compareMessages(nextCursor, knownNewest) <= 0) {
+        more = false;
+      }
+    }
+    if (roomCode === room) {
+      if (!wasComplete && !(await removeCachedMessagesNotIn(room, serverIds))) {
+        throw new Error('Could not reconcile saved chat history on this device.');
+      }
+      serverHasOlder = false;
+      try { localStorage.setItem(`${HISTORY_COMPLETE_PREFIX}${room}`, 'true'); } catch { /* IndexedDB still retains the messages. */ }
+      $('historyStatus').textContent = 'All encrypted chat history is saved on this device.';
+      await updateLoadOlderButton();
+      historyBackfillRoom = '';
+    }
+  } catch (error) {
+    if (roomCode === room) {
+      historyBackfillRoom = '';
+      $('historyStatus').textContent = 'Some older messages could not be saved. Reconnect to continue.';
+      status(error.message || 'Could not save older chat messages.');
+    }
+  }
+}
+async function updateLoadOlderButton() {
+  const button = $('loadOlder');
+  if (!button || !roomCode) {
+    if (button) button.hidden = true;
+    return;
+  }
+  const firstRow = $('messages').querySelector('.message');
+  let hasCachedOlder = false;
+  if (firstRow) {
+    const cached = await readCachedMessages(roomCode);
+    const index = cached.findIndex((item) => String(item.id) === firstRow.dataset.messageId);
+    hasCachedOlder = index > 0;
+  }
+  button.hidden = !(hasCachedOlder || serverHasOlder);
+  button.disabled = olderMessagesLoading;
+}
+async function loadOlderMessages() {
+  if (!roomCode || olderMessagesLoading) return;
+  olderMessagesLoading = true;
+  const room = roomCode;
+  const button = $('loadOlder');
+  button.disabled = true;
+  try {
+    const firstRow = $('messages').querySelector('.message');
+    if (!firstRow) return;
+    const cached = await readCachedMessages(room);
+    if (roomCode !== room) return;
+    const index = cached.findIndex((item) => String(item.id) === firstRow.dataset.messageId);
+    if (index > 0) {
+      const start = Math.max(0, index - HISTORY_UI_PAGE_SIZE);
+      await renderMessages(cached.slice(start, index), { prepend: true });
+    } else if (serverHasOlder) {
+      const cursor = { id: firstRow.dataset.messageId, created_at: firstRow.dataset.createdAt };
+      const result = await apiRequest(messagePageUrl(room, cursor));
+      if (roomCode !== room) return;
+      const older = (result.messages || []).filter((item) => !locallyDeletedMessageIds.has(String(item.id)));
+      serverHasOlder = result.hasMore === true;
+      if (!(await cacheEncryptedMessages(room, older))) {
+        status('Could not save the older messages on this device.');
+      }
+      await renderMessages(older, { prepend: true });
+    }
+    await updateLoadOlderButton();
+  } catch (error) {
+    status(error.message || 'Could not load older messages.');
+  } finally {
+    olderMessagesLoading = false;
+    button.disabled = false;
+  }
 }
 function subscribe() {
   if (pollTimer) clearInterval(pollTimer);
@@ -625,7 +894,7 @@ function subscribe() {
     }
   }, 5000);
   status(localHistorySaved
-    ? 'Chat connected. Recent encrypted messages are saved on this device.'
+    ? 'Chat connected. Messages are being saved on this device.'
     : 'Chat connected. Local history could not be saved in this browser.');
 }
 function updateRoomHeading() {
@@ -646,6 +915,9 @@ async function enterRoom(code, name) {
   locallyDeletedMessageIds.clear();
   messagesInitialized = false;
   showingCachedHistory = false;
+  historyBackfillRoom = '';
+  serverHasOlder = false;
+  $('loadOlder').hidden = true;
   $('messages').replaceChildren();
   localHistorySaved = false;
   let roomInfo;
@@ -656,7 +928,7 @@ async function enterRoom(code, name) {
       body: JSON.stringify({ roomCode: requestedCode })
     });
   } catch (error) {
-    const cached = readCachedMessages(requestedCode);
+    const cached = await readCachedMessages(requestedCode);
     if (!cached.length) {
       status(error.message || 'Could not join this chat.');
       return;
@@ -673,10 +945,12 @@ async function enterRoom(code, name) {
   updateRoomHeading();
   showPage('chat');
   if (offline) {
-    const cached = readCachedMessages(roomCode);
+    const cached = await readCachedMessages(roomCode);
     localHistorySaved = true;
-    await renderMessages(cached);
+    await renderMessages(cached.slice(-MAX_DISPLAYED_MESSAGES));
     showingCachedHistory = true;
+    $('historyStatus').textContent = 'Showing encrypted messages saved on this device.';
+    await updateLoadOlderButton();
     status('Showing encrypted history saved on this device. Reconnect to open the shared chat.');
     return;
   }
@@ -684,14 +958,16 @@ async function enterRoom(code, name) {
     await loadMessages();
     subscribe();
   } catch (error) {
-    const cached = readCachedMessages(roomCode);
+    const cached = await readCachedMessages(roomCode);
     if (!cached.length) {
       status(error.message);
       return;
     }
     localHistorySaved = true;
-    await renderMessages(cached);
+    await renderMessages(cached.slice(-MAX_DISPLAYED_MESSAGES));
     showingCachedHistory = true;
+    $('historyStatus').textContent = 'Showing encrypted messages saved on this device.';
+    await updateLoadOlderButton();
     status('Showing encrypted history saved on this device. Reconnect to refresh or send messages.');
   }
 }
@@ -717,6 +993,7 @@ $('createRoom').addEventListener('click', async () => {
   }
 });
 $('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('profileName').value));
+$('loadOlder').addEventListener('click', loadOlderMessages);
 $('editRoomName').addEventListener('click', () => {
   $('roomNameInput').value = activeRoomName;
   $('roomNameStatus').textContent = '';
@@ -791,7 +1068,7 @@ $('plain').addEventListener('keydown', (event) => {
 $('refresh').addEventListener('click', async () => { try { await loadMessages(); status('Refreshed.'); } catch (error) { status(error.message); } });
 $('leave').addEventListener('click', () => {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = null; renderedMessageIds.clear(); locallyDeletedMessageIds.clear(); messagesInitialized = false; showingCachedHistory = false; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren();
+  pollTimer = null; renderedMessageIds.clear(); locallyDeletedMessageIds.clear(); messagesInitialized = false; showingCachedHistory = false; historyBackfillRoom = ''; serverHasOlder = false; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren(); $('loadOlder').hidden = true;
   $('roomTitle').textContent = '';
   $('roomCode').textContent = '';
   savedProfile.room = '';
