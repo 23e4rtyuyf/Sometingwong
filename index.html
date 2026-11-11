@@ -132,10 +132,14 @@
       <button id="showTerms" class="secondary" type="button">Read Terms of Service</button>
       <p id="termsAcceptanceStatus" class="small">Review and accept the Terms before continuing.</p>
       <form id="accessForm">
-        <input type="text" name="username" autocomplete="username" hidden>
-        <label for="accessPassword">Access password</label>
-        <input id="accessPassword" type="password" autocomplete="current-password">
-        <button id="unlock" type="submit" style="width:100%;margin-top:1rem">Unlock</button>
+        <p class="small">Sign in with the account email and password provided by your administrator. No verification email is required.</p>
+        <label for="accountEmail">Account email</label>
+        <input id="accountEmail" type="email" autocomplete="username" required>
+        <label for="accountPassword">Account password</label>
+        <input id="accountPassword" type="password" autocomplete="current-password" required>
+        <label for="accessPassword">Chat encryption password</label>
+        <input id="accessPassword" type="password" autocomplete="off" required>
+        <button id="unlock" type="submit" style="width:100%;margin-top:1rem">Sign in</button>
         <p id="accessStatus" class="status" role="status" aria-live="polite"></p>
       </form>
     </div>
@@ -195,7 +199,7 @@
     <button id="classicTab" type="button">Encrypt / decrypt</button>
   </nav>
   </header>
-  <p class="small">Encrypted chat history is saved on this device after it syncs. The app does not store your access password.</p>
+  <p class="small">Encrypted chat history is saved on this device after it syncs. The app does not store your account or chat encryption password.</p>
 
   <section id="chatPage">
   <div class="intro">
@@ -288,11 +292,8 @@
 <script>
 'use strict';
 const API_BASE_URL = (window.CHAT_API_BASE_URL || '').replace(/\/+$/, '');
-const AUTH_ITERATIONS = 600000;
-const AUTH_SALT = 'private-live-chat-auth-v1';
+const ENCRYPTION_ITERATIONS = 600000;
 const PROFILE_KEY = 'private-chat-profile-v1';
-const IDENTITY_TOKEN_KEY = 'private-chat-identity-v1';
-const API_SESSION_KEY = 'private-chat-api-session-v1';
 const MESSAGE_CACHE_PREFIX = 'private-chat-encrypted-history-v1:';
 const HISTORY_COMPLETE_PREFIX = 'private-chat-history-complete-v2:';
 const MAX_DISPLAYED_MESSAGES = 500;
@@ -322,18 +323,6 @@ let olderMessagesLoading = false;
 let historyDbPromise = null;
 
 function status(message) { $('status').textContent = message; }
-function savedSessionToken() {
-  try { return sessionStorage.getItem(API_SESSION_KEY) || ''; }
-  catch { return ''; }
-}
-function getOrCreateIdentityToken() {
-  let token = localStorage.getItem(IDENTITY_TOKEN_KEY) || '';
-  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
-    token = b64(crypto.getRandomValues(new Uint8Array(32)));
-    localStorage.setItem(IDENTITY_TOKEN_KEY, token);
-  }
-  return token;
-}
 function lockForExpiredSession() {
   if (!apiToken) return;
   apiToken = '';
@@ -342,7 +331,7 @@ function lockForExpiredSession() {
   pollTimer = null;
   $('accessGate').classList.remove('hidden');
   $('protectedApp').classList.add('hidden');
-  $('accessStatus').textContent = 'Your session expired. Enter the access password again.';
+  $('accessStatus').textContent = 'Your session expired. Sign in again to continue.';
 }
 async function apiRequest(path, options = {}, includeAuth = true) {
   const headers = new Headers(options.headers || {});
@@ -363,6 +352,31 @@ async function apiRequest(path, options = {}, includeAuth = true) {
     throw new Error(payload.error || 'The chat server could not complete the request.');
   }
   return payload;
+}
+async function signInWithAccount(email, password) {
+  if (!window.CHAT_SUPABASE_URL || !window.CHAT_API_KEY) {
+    throw new Error('Account sign-in is not configured.');
+  }
+  let response;
+  try {
+    response = await fetch(`${window.CHAT_SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: {
+        apikey: window.CHAT_API_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ email, password }),
+      cache: 'no-store',
+    });
+  } catch {
+    throw new Error('Could not reach account sign-in. Check your connection.');
+  }
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || typeof result.access_token !== 'string') {
+    throw new Error('Account sign-in failed. Check your email and password.');
+  }
+  return result.access_token;
 }
 function openHistoryDatabase() {
   if (!window.indexedDB) return Promise.reject(new Error('This browser does not support local chat history.'));
@@ -542,15 +556,6 @@ function saveProfile() {
   $('profileName').value = nickname;
   $('profileId').textContent = profile.id;
 }
-async function passwordProof(password, nonce) {
-  const material = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({
-    name: 'PBKDF2', salt: encoder.encode(AUTH_SALT), iterations: AUTH_ITERATIONS, hash: 'SHA-256'
-  }, material, 256);
-  const key = await crypto.subtle.importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, nonce));
-  return [...signature].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-}
 $('showTerms').addEventListener('click', () => {
   $('termsStatus').textContent = '';
   $('termsDialog').showModal();
@@ -573,30 +578,26 @@ $('accessForm').addEventListener('submit', async (event) => {
     $('showTerms').focus();
     return;
   }
+  const email = $('accountEmail').value.trim();
+  const accountPassword = $('accountPassword').value;
   const candidate = $('accessPassword').value;
-  if (!candidate) {
+  if (!email || !accountPassword || !candidate) {
+    $('accountPassword').value = '';
     $('accessPassword').value = '';
-    $('accessPassword').focus();
-    $('accessStatus').textContent = 'Incorrect access password.';
+    $('accountEmail').focus();
+    $('accessStatus').textContent = 'Enter your account details and chat encryption password.';
     return;
   }
-  $('accessStatus').textContent = 'Checking access…';
+  $('accessStatus').textContent = 'Signing in…';
   try {
-    const challenge = await apiRequest('/api/auth/challenge', { method: 'GET' }, false);
-    const proof = await passwordProof(candidate, unb64(challenge.nonce));
-    const identityToken = getOrCreateIdentityToken();
-    const session = await apiRequest('/api/auth/verify', {
+    const supabaseAccessToken = await signInWithAccount(email, accountPassword);
+    const session = await apiRequest('/api/auth/session', {
       method: 'POST',
-      body: JSON.stringify({
-        challengeId: challenge.challengeId,
-        proof,
-        identityToken,
-        previousToken: savedSessionToken(),
-      })
+      body: JSON.stringify({ supabaseAccessToken })
     }, false);
     apiToken = session.token;
-    try { sessionStorage.setItem(API_SESSION_KEY, apiToken); } catch { /* The stable identity token remains in local storage. */ }
     encryptionSecret = candidate;
+    $('accountPassword').value = '';
     $('accessPassword').value = '';
     $('accessStatus').textContent = '';
     $('accessGate').classList.add('hidden');
@@ -608,9 +609,10 @@ $('accessForm').addEventListener('submit', async (event) => {
       await enterRoom(savedProfile.room, savedProfile.name);
     }
   } catch (error) {
+    $('accountPassword').value = '';
     $('accessPassword').value = '';
-    $('accessPassword').focus();
-    $('accessStatus').textContent = error.message || 'Could not verify the access password.';
+    $('accountPassword').focus();
+    $('accessStatus').textContent = error.message || 'Could not sign in to your account.';
   }
 });
 function b64(bytes) {
@@ -625,7 +627,7 @@ function unb64(value) {
 }
 async function keyFor(secret, salt) {
   const material = await crypto.subtle.importKey('raw', encoder.encode(secret), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: AUTH_ITERATIONS, hash: 'SHA-256' },
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: ENCRYPTION_ITERATIONS, hash: 'SHA-256' },
     material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
 async function encryptMessage(text, secret) {

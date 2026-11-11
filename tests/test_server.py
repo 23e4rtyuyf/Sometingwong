@@ -1,5 +1,3 @@
-import hashlib
-import hmac
 import json
 import os
 import re
@@ -9,14 +7,14 @@ import unittest
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import server
 
 
 ORIGIN = "https://23e4rtyuyf.github.io"
-TEST_PASSWORD = "correct horse battery staple - test only"
 TEST_SENDER_ID = "6f8f7d3e-bbe4-4dbb-9084-7f33a0c2d8fc"
+TEST_SUPABASE_ACCESS_TOKEN = "a" * 128
 
 
 class ServerApiTests(unittest.TestCase):
@@ -35,7 +33,6 @@ class ServerApiTests(unittest.TestCase):
 
     def setUp(self):
         self.env = patch.dict(os.environ, {
-            "CHAT_ACCESS_PASSWORD": TEST_PASSWORD,
             "SESSION_SECRET": "test-session-secret-do-not-use",
             "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-do-not-use",
             "CHAT_ALLOWED_ORIGINS": ORIGIN,
@@ -43,10 +40,7 @@ class ServerApiTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         with server._lock:
-            server._challenges.clear()
             server._sessions.clear()
-            server._identities.clear()
-            server._failed_logins.clear()
             server._room_join_failures.clear()
         self.saved_message = None
         self.messages = [{
@@ -61,7 +55,7 @@ class ServerApiTests(unittest.TestCase):
         self.legacy_room_codes = {"123456"}
         self.members = set()
         self.supabase = patch.object(server, "_supabase_request", side_effect=self.fake_supabase)
-        self.auth_user_patch = patch.object(server, "_create_anonymous_user", return_value=TEST_SENDER_ID)
+        self.auth_user_patch = patch.object(server, "_supabase_auth_user", return_value=TEST_SENDER_ID)
         self.supabase.start()
         self.auth_user = self.auth_user_patch.start()
         self.addCleanup(self.supabase.stop)
@@ -159,24 +153,11 @@ class ServerApiTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read() or b"{}")
 
-    def sign_in(self, identity_token="A" * 43):
-        status_code, challenge = self.request("/api/auth/challenge")
-        self.assertEqual(status_code, 200)
-        nonce = challenge["nonce"]
-        import base64
-        nonce_bytes = base64.urlsafe_b64decode(nonce + "=" * ((4 - len(nonce) % 4) % 4))
-        key = hashlib.pbkdf2_hmac(
-            "sha256", TEST_PASSWORD.encode(), server.AUTH_SALT, server.AUTH_ITERATIONS
-        )
-        proof = hmac.new(key, nonce_bytes, hashlib.sha256).hexdigest()
+    def sign_in(self):
         status_code, session = self.request(
-            "/api/auth/verify",
+            "/api/auth/session",
             method="POST",
-            payload={
-                "challengeId": challenge["challengeId"],
-                "proof": proof,
-                "identityToken": identity_token,
-            },
+            payload={"supabaseAccessToken": TEST_SUPABASE_ACCESS_TOKEN},
         )
         self.assertEqual(status_code, 200)
         return session["token"]
@@ -195,7 +176,10 @@ class ServerApiTests(unittest.TestCase):
         self.assertIn("Sign in", payload["error"])
 
         status_code, _ = self.request(
-            "/api/auth/challenge", origin="https://attacker.example"
+            "/api/auth/session",
+            method="POST",
+            payload={"supabaseAccessToken": TEST_SUPABASE_ACCESS_TOKEN},
+            origin="https://attacker.example",
         )
         self.assertEqual(status_code, 403)
 
@@ -206,32 +190,39 @@ class ServerApiTests(unittest.TestCase):
             headers={
                 "Origin": ORIGIN,
                 "Access-Control-Request-Method": "POST",
-                "Access-Control-Request-Headers": "authorization,content-type",
+                "Access-Control-Request-Headers": "authorization,content-type,apikey",
             },
         )
         with urlopen(request, timeout=3) as response:
             self.assertEqual(response.status, 204)
             self.assertEqual(response.headers["Access-Control-Allow-Origin"], ORIGIN)
             self.assertIn("Authorization", response.headers["Access-Control-Allow-Headers"])
+            self.assertIn("apikey", response.headers["Access-Control-Allow-Headers"])
 
-    def test_password_proof_is_one_time_and_invalid_proof_is_rejected(self):
-        status_code, challenge = self.request("/api/auth/challenge")
-        self.assertEqual(status_code, 200)
+    def test_invalid_supabase_account_token_is_rejected(self):
+        self.auth_user.side_effect = server.ApiError(
+            401, "Account sign-in failed. Check your email and password."
+        )
         status_code, payload = self.request(
-            "/api/auth/verify",
+            "/api/auth/session",
             method="POST",
-            payload={"challengeId": challenge["challengeId"], "proof": "0" * 64},
+            payload={"supabaseAccessToken": TEST_SUPABASE_ACCESS_TOKEN},
         )
         self.assertEqual(status_code, 401)
-        self.assertEqual(payload["error"], "Incorrect access password.")
+        self.assertIn("sign-in failed", payload["error"])
 
-        status_code, payload = self.request(
-            "/api/auth/verify",
-            method="POST",
-            payload={"challengeId": challenge["challengeId"], "proof": "0" * 64},
-        )
-        self.assertEqual(status_code, 401)
-        self.assertEqual(payload["error"], "Sign-in expired. Try again.")
+    def test_anonymous_supabase_user_cannot_create_an_app_session(self):
+        self.auth_user_patch.stop()
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "id": TEST_SENDER_ID,
+            "is_anonymous": True,
+        }).encode()
+        with patch.object(server, "urlopen", return_value=response):
+            with self.assertRaises(server.ApiError) as raised:
+                server._supabase_auth_user(TEST_SUPABASE_ACCESS_TOKEN)
+        self.assertEqual(raised.exception.status, 401)
 
     def test_expired_session_is_rejected(self):
         token = self.sign_in()
@@ -241,11 +232,7 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(status_code, 401)
         self.assertIn("expired", payload["error"])
 
-    def test_sign_in_reuses_the_same_device_identity(self):
-        self.auth_user.side_effect = [
-            TEST_SENDER_ID,
-            "7f2af4b4-12a3-4f1f-a910-6e8769fa05cd",
-        ]
+    def test_sign_in_uses_the_authenticated_supabase_account_id(self):
         first_token = self.sign_in()
         second_token = self.sign_in()
 

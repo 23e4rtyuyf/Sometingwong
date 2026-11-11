@@ -1,15 +1,11 @@
 const DEFAULT_SUPABASE_URL = "https://iozdwksqfhlhcrbhrwfl.supabase.co";
 const ALLOWED_ORIGIN = "https://23e4rtyuyf.github.io";
-const AUTH_SALT = "private-live-chat-auth-v1";
-const AUTH_ITERATIONS = 600_000;
-const CHALLENGE_TTL_SECONDS = 90;
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const MAX_BODY_BYTES = 32_000;
 const MAX_MESSAGES = 500;
 const ROOM_JOIN_FAILURE_WINDOW_SECONDS = 15 * 60;
 const MAX_ROOM_JOIN_FAILURES = 8;
 const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const IDENTITY_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const encoder = new TextEncoder();
 
 class ApiError extends Error {
@@ -33,7 +29,6 @@ function config() {
     supabaseUrl: (Deno.env.get("SUPABASE_URL") || DEFAULT_SUPABASE_URL).replace(/\/+$/, ""),
     serviceKey: Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || envJsonKey("SUPABASE_SECRET_KEYS"),
     publishableKey: Deno.env.get("SUPABASE_ANON_KEY") || envJsonKey("SUPABASE_PUBLISHABLE_KEYS"),
-    password: Deno.env.get("CHAT_ACCESS_PASSWORD") || "",
     sessionSecret: Deno.env.get("SESSION_SECRET") || "",
   };
 }
@@ -108,15 +103,6 @@ function decodeBase64Url(value) {
   const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
   const binary = atob(padded);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
-function decodeHex(value) {
-  if (typeof value !== "string" || !/^[0-9a-f]{64}$/i.test(value)) return null;
-  const bytes = new Uint8Array(value.length / 2);
-  for (let index = 0; index < value.length; index += 2) {
-    bytes[index / 2] = Number.parseInt(value.slice(index, index + 2), 16);
-  }
-  return bytes;
 }
 
 async function hmac(secret, value) {
@@ -269,204 +255,48 @@ async function recordRoomJoinFailure(hashes) {
   })));
 }
 
-async function issueChallenge(request) {
-  const settings = config();
-  if (!settings.password || !settings.sessionSecret || !settings.serviceKey) {
-    throw new ApiError(503, "Server-side sign-in is not configured.");
-  }
-  const addressHash = await hashForStorage(settings.sessionSecret, clientAddress(request));
-  const now = new Date().toISOString();
-  const failed = await supabaseRequest("chat_api_failed_logins", {
-    select: "attempt_id",
-    address_hash: `eq.${addressHash}`,
-    attempted_at: `gt.${new Date(Date.now() - 15 * 60 * 1000).toISOString()}`,
-    limit: "8",
-  });
-  if (Array.isArray(failed) && failed.length >= 8) {
-    throw new ApiError(429, "Too many sign-in attempts. Try again later.");
-  }
-  const open = await supabaseRequest("chat_api_challenges", {
-    select: "challenge_id",
-    address_hash: `eq.${addressHash}`,
-    expires_at: `gt.${now}`,
-    limit: "5",
-  });
-  if (Array.isArray(open) && open.length >= 5) {
-    throw new ApiError(429, "Too many open sign-in attempts. Try again shortly.");
-  }
-  await cleanupExpiredRows();
-  const challengeId = encodeBase64Url(randomBytes(24));
-  const nonce = encodeBase64Url(randomBytes(32));
-  const expiresAt = new Date(Date.now() + CHALLENGE_TTL_SECONDS * 1000).toISOString();
-  await supabaseRequest("chat_api_challenges", {}, {
-    method: "POST",
-    body: {
-      challenge_id: challengeId,
-      nonce,
-      address_hash: addressHash,
-      expires_at: expiresAt,
-    },
-    prefer: "return=minimal",
-  });
-  return { challengeId, nonce };
-}
-
-async function verifyPasswordProof(proof, nonce) {
-  const settings = config();
-  const proofBytes = decodeHex(proof);
-  if (!proofBytes) return false;
-  const keyMaterial = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(settings.password),
-    "PBKDF2",
-    false,
-    ["deriveKey"],
-  );
-  const proofKey = await crypto.subtle.deriveKey(
-    {
-      name: "PBKDF2",
-      salt: encoder.encode(AUTH_SALT),
-      iterations: AUTH_ITERATIONS,
-      hash: "SHA-256",
-    },
-    keyMaterial,
-    { name: "HMAC", hash: "SHA-256", length: 256 },
-    false,
-    ["verify"],
-  );
-  return await crypto.subtle.verify("HMAC", proofKey, proofBytes, decodeBase64Url(nonce));
-}
-
-async function createAnonymousUser() {
+async function supabaseUserIdFromAccessToken(accessToken) {
   const settings = config();
   if (!settings.publishableKey) {
-    throw new ApiError(503, "Supabase anonymous sign-in is not configured.");
+    throw new ApiError(503, "Account sign-in is not configured.");
   }
   let response;
   try {
-    response = await fetch(`${settings.supabaseUrl}/auth/v1/signup`, {
-      method: "POST",
+    response = await fetch(`${settings.supabaseUrl}/auth/v1/user`, {
       headers: {
         apikey: settings.publishableKey,
-        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
         Accept: "application/json",
       },
-      body: JSON.stringify({ data: {} }),
       cache: "no-store",
     });
   } catch {
-    throw new ApiError(503, "Supabase anonymous sign-in is unavailable.");
+    throw new ApiError(503, "Account sign-in is temporarily unavailable.");
   }
-  if (!response.ok) {
-    console.error(`[chat-api] Supabase anonymous signup failed with status ${response.status}.`);
-    throw new ApiError(503, "Supabase anonymous sign-in is unavailable.");
+  if (!response.ok) throw new ApiError(401, "Account sign-in failed. Check your email and password.");
+  const user = await response.json().catch(() => ({}));
+  if (user?.is_anonymous === true
+    || typeof user?.id !== "string"
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(user.id)) {
+    throw new ApiError(401, "Account sign-in failed. Check your email and password.");
   }
-  const payload = await response.json().catch(() => ({}));
-  const user = payload?.user || payload;
-  const userId = user?.id;
-  if (typeof userId !== "string"
-    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
-    throw new ApiError(503, "Supabase anonymous sign-in returned an invalid account.");
-  }
-  return userId;
+  return user.id;
 }
 
-async function storedSessionForToken(token) {
+async function createApiSession(request) {
   const settings = config();
-  const tokenHash = await hashForStorage(settings.sessionSecret, token);
-  const rows = await supabaseRequest("chat_api_sessions", {
-    select: "sender_id,expires_at",
-    token_hash: `eq.${tokenHash}`,
-    limit: "1",
-  });
-  return Array.isArray(rows) ? rows[0] || null : null;
-}
-
-async function verifyChallenge(request) {
-  const settings = config();
+  if (!settings.sessionSecret || !settings.serviceKey) {
+    throw new ApiError(503, "Server-side sessions are not configured.");
+  }
   const body = await readJson(request);
-  const challengeId = body.challengeId;
-  const proof = body.proof;
-  const identityToken = typeof body.identityToken === "string" ? body.identityToken : "";
-  const previousToken = typeof body.previousToken === "string" ? body.previousToken : "";
-  if (typeof challengeId !== "string"
-    || !/^[A-Za-z0-9_-]{32}$/.test(challengeId)
-    || typeof proof !== "string") {
-    throw new ApiError(400, "Invalid sign-in proof.");
+  const accessToken = typeof body.supabaseAccessToken === "string"
+    ? body.supabaseAccessToken
+    : "";
+  if (!/^[A-Za-z0-9._-]{64,8192}$/.test(accessToken)) {
+    throw new ApiError(401, "Account sign-in failed. Check your email and password.");
   }
-  if (identityToken && !IDENTITY_TOKEN_RE.test(identityToken)) {
-    throw new ApiError(400, "Invalid local chat identity.");
-  }
-  const addressHash = await hashForStorage(settings.sessionSecret, clientAddress(request));
-  const challenges = await supabaseRequest("chat_api_challenges", {
-    select: "challenge_id,nonce,address_hash,expires_at",
-    challenge_id: `eq.${challengeId}`,
-    address_hash: `eq.${addressHash}`,
-    expires_at: `gt.${new Date().toISOString()}`,
-  }, {
-    method: "DELETE",
-    prefer: "return=representation",
-  });
-  const challenge = Array.isArray(challenges) ? challenges[0] : null;
-  if (!challenge) throw new ApiError(401, "Sign-in expired. Try again.");
-  if (!settings.password || !settings.sessionSecret) {
-    throw new ApiError(503, "Server-side sign-in is not configured.");
-  }
-  let isValid = false;
-  try {
-    isValid = await verifyPasswordProof(proof, challenge.nonce);
-  } catch {
-    isValid = false;
-  }
-  if (!isValid) {
-    await supabaseRequest("chat_api_failed_logins", {}, {
-      method: "POST",
-      body: {
-        attempt_id: encodeBase64Url(randomBytes(18)),
-        address_hash: addressHash,
-      },
-      prefer: "return=minimal",
-    });
-    throw new ApiError(401, "Incorrect access password.");
-  }
-  let senderId = "";
-  if (identityToken) {
-    const identityRecord = await storedSessionForToken(identityToken);
-    if (identityRecord && typeof identityRecord.sender_id === "string") {
-      senderId = identityRecord.sender_id;
-    } else {
-      if (/^[A-Za-z0-9_-]{1,128}$/.test(previousToken)) {
-        const previousRecord = await storedSessionForToken(previousToken);
-        const previousExpiry = Date.parse(previousRecord?.expires_at || "");
-        const maxSessionExpiry = Date.now() + (SESSION_TTL_SECONDS + 60) * 1000;
-        if (previousRecord && Number.isFinite(previousExpiry) && previousExpiry <= maxSessionExpiry) {
-          senderId = previousRecord.sender_id;
-        }
-      }
-      if (!senderId) senderId = await createAnonymousUser();
-      const identityHash = await hashForStorage(settings.sessionSecret, identityToken);
-      // Keep a device-to-sender mapping in the existing table; requireSession
-      // rejects far-future rows so this identity token cannot act as an API session.
-      await supabaseRequest("chat_api_sessions", {
-        on_conflict: "token_hash",
-      }, {
-        method: "POST",
-        body: {
-          token_hash: identityHash,
-          sender_id: senderId,
-          expires_at: "9999-12-31T23:59:59.999Z",
-        },
-        prefer: "resolution=ignore-duplicates,return=minimal",
-      });
-      const stableRecord = await storedSessionForToken(identityToken);
-      if (!stableRecord || typeof stableRecord.sender_id !== "string") {
-        throw new ApiError(503, "Could not save this device's chat identity.");
-      }
-      senderId = stableRecord.sender_id;
-    }
-  } else {
-    senderId = await createAnonymousUser();
-  }
+  const senderId = await supabaseUserIdFromAccessToken(accessToken);
+  await cleanupExpiredRows();
   const token = encodeBase64Url(randomBytes(32));
   const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
   const tokenHash = await hashForStorage(settings.sessionSecret, token);
@@ -475,9 +305,6 @@ async function verifyChallenge(request) {
     body: { token_hash: tokenHash, sender_id: senderId, expires_at: expiresAt },
     prefer: "return=minimal",
   });
-  await supabaseRequest("chat_api_failed_logins", {
-    address_hash: `eq.${addressHash}`,
-  }, { method: "DELETE", prefer: "return=minimal" });
   return { token, expiresAt: Math.floor(Date.parse(expiresAt) / 1000) };
 }
 
@@ -734,16 +561,13 @@ async function handle(request) {
     return jsonResponse(request, 200, {
       ok: true,
       storageConfigured: Boolean(settings.serviceKey),
-      authConfigured: Boolean(settings.password && settings.sessionSecret),
+      authConfigured: Boolean(settings.publishableKey && settings.sessionSecret),
     });
   }
   try {
     requireOrigin(request);
-    if (request.method === "GET" && route === "/api/auth/challenge") {
-      return jsonResponse(request, 200, await issueChallenge(request));
-    }
-    if (request.method === "POST" && route === "/api/auth/verify") {
-      return jsonResponse(request, 200, await verifyChallenge(request));
+    if (request.method === "POST" && route === "/api/auth/session") {
+      return jsonResponse(request, 200, await createApiSession(request));
     }
     if (request.method === "POST" && route === "/api/auth/logout") {
       return jsonResponse(request, 200, await logout(request));

@@ -5,7 +5,5 @@ window.CHAT_API_BASE_URL =
   window.location.hostname === "23e4rtyuyf.github.io"
     ? "https://iozdwksqfhlhcrbhrwfl.supabase.co/functions/v1/swift-endpoint"
     : "";
-window.CHAT_API_KEY =
-  window.location.hostname === "23e4rtyuyf.github.io"
-    ? "sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM"
-    : "";
+window.CHAT_API_KEY = "sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM";
+window.CHAT_SUPABASE_URL = "https://iozdwksqfhlhcrbhrwfl.supabase.co";

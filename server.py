@@ -1,6 +1,5 @@
 """Serve the static chat and proxy authenticated chat operations to Supabase."""
 
-import base64
 import hashlib
 import hmac
 import json
@@ -20,15 +19,11 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 SUPABASE_URL = "https://iozdwksqfhlhcrbhrwfl.supabase.co"
 SUPABASE_ANON_KEY = "sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM"
-AUTH_SALT = b"private-live-chat-auth-v1"
-AUTH_ITERATIONS = 600_000
-CHALLENGE_TTL = 90
 SESSION_TTL = 8 * 60 * 60
 MAX_BODY_BYTES = 32_000
 MAX_MESSAGES = 500
 ROOM_JOIN_FAILURE_WINDOW = 15 * 60
 MAX_ROOM_JOIN_FAILURES = 8
-IDENTITY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 CURSOR_TIMESTAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$")
 ROOM_RE = re.compile(r"^[0-9]{6}$")
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,40}$")
@@ -49,10 +44,7 @@ PUBLIC_FILES = {
 }
 
 _lock = threading.RLock()
-_challenges = {}
 _sessions = {}
-_identities = {}
-_failed_logins = {}
 _room_join_failures = {}
 
 
@@ -72,10 +64,6 @@ def _allowed_origins():
             if domain:
                 origins.add(domain if "://" in domain else f"https://{domain}")
     return origins
-
-
-def _encode_b64(data):
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
 def _decode_json(data):
@@ -124,31 +112,31 @@ def _supabase_request(path, method="GET", body=None, query=None, prefer="return=
         raise ApiError(502, "Chat storage is temporarily unavailable.")
 
 
-def _create_anonymous_user():
+def _supabase_auth_user(access_token):
     request = Request(
-        f"{SUPABASE_URL}/auth/v1/signup",
-        data=json.dumps({"data": {}}).encode("utf-8"),
-        method="POST",
+        f"{SUPABASE_URL}/auth/v1/user",
         headers={
             "apikey": SUPABASE_ANON_KEY,
-            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
         },
     )
     try:
         with urlopen(request, timeout=12) as response:
             payload = json.loads(response.read())
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
-        raise ApiError(503, "Supabase anonymous sign-in is unavailable.")
-    user = payload.get("user") or payload if isinstance(payload, dict) else None
-    if not isinstance(user, dict):
-        raise ApiError(503, "Supabase anonymous sign-in returned an invalid account.")
-    user_id = user.get("id") if isinstance(user, dict) else None
-    if not isinstance(user_id, str) or not re.fullmatch(
+    except HTTPError as error:
+        if error.code in (400, 401, 403):
+            raise ApiError(401, "Account sign-in failed. Check your email and password.")
+        raise ApiError(503, "Account sign-in is temporarily unavailable.")
+    except (URLError, TimeoutError, OSError, json.JSONDecodeError):
+        raise ApiError(503, "Account sign-in is temporarily unavailable.")
+    user_id = payload.get("id") if isinstance(payload, dict) else None
+    if (not isinstance(payload, dict) or payload.get("is_anonymous") is True
+        or not isinstance(user_id, str) or not re.fullmatch(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
         user_id,
-    ):
-        raise ApiError(503, "Supabase anonymous sign-in returned an invalid account.")
+    )):
+        raise ApiError(401, "Account sign-in failed. Check your email and password.")
     return user_id
 
 
@@ -169,7 +157,7 @@ class SiteHandler(BaseHTTPRequestHandler):
         if origin in _allowed_origins():
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, apikey")
             self.send_header("Access-Control-Max-Age", "600")
             self.send_header("Vary", "Origin")
 
@@ -229,14 +217,11 @@ class SiteHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "ok": True,
                 "storageConfigured": bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY")),
-                "authConfigured": bool(os.environ.get("CHAT_ACCESS_PASSWORD") and os.environ.get("SESSION_SECRET")),
+                "authConfigured": bool(SUPABASE_ANON_KEY and os.environ.get("SESSION_SECRET")),
             })
             return
         try:
             self._require_origin()
-            if path.path == "/api/auth/challenge":
-                self._issue_challenge()
-                return
             if path.path == "/api/messages":
                 self._read_messages(parse_qs(path.query))
                 return
@@ -248,8 +233,8 @@ class SiteHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             self._require_origin()
-            if path == "/api/auth/verify":
-                self._verify_challenge()
+            if path == "/api/auth/session":
+                self._create_api_session()
                 return
             if path == "/api/auth/logout":
                 self._logout()
@@ -297,86 +282,18 @@ class SiteHandler(BaseHTTPRequestHandler):
             return
         self._serve_file(path, head_only=True)
 
-    def _issue_challenge(self):
-        if not all(os.environ.get(key) for key in (
-            "CHAT_ACCESS_PASSWORD", "SESSION_SECRET", "SUPABASE_SERVICE_ROLE_KEY"
-        )):
-            raise ApiError(503, "Server-side sign-in is not configured.")
-        address = self.client_address[0]
-        now = time.time()
-        with _lock:
-            for address, stamps in list(_failed_logins.items()):
-                recent = [stamp for stamp in stamps if now - stamp < 900]
-                if recent:
-                    _failed_logins[address] = recent
-                else:
-                    _failed_logins.pop(address, None)
-            for key, value in list(_challenges.items()):
-                if value["expires"] <= now:
-                    _challenges.pop(key, None)
-            if len(_challenges) >= 2_000:
-                raise ApiError(503, "Sign-in is temporarily busy. Try again shortly.")
-            attempts = [stamp for stamp in _failed_logins.get(address, []) if now - stamp < 900]
-            _failed_logins[address] = attempts
-            if len(attempts) >= 8:
-                raise ApiError(429, "Too many sign-in attempts. Try again later.")
-            if sum(1 for value in _challenges.values() if value["address"] == address) >= 5:
-                raise ApiError(429, "Too many open sign-in attempts. Try again shortly.")
-            challenge_id = secrets.token_urlsafe(24)
-            nonce = secrets.token_bytes(32)
-            _challenges[challenge_id] = {
-                "nonce": nonce,
-                "address": address,
-                "expires": now + CHALLENGE_TTL,
-            }
-        self._send_json(200, {"challengeId": challenge_id, "nonce": _encode_b64(nonce)})
-
-    def _verify_challenge(self):
-        request = self._read_body()
-        challenge_id = request.get("challengeId")
-        proof = request.get("proof")
-        identity_token = request.get("identityToken")
-        previous_token = request.get("previousToken")
-        if not isinstance(challenge_id, str) or not isinstance(proof, str):
-            raise ApiError(400, "Invalid sign-in proof.")
-        if identity_token is not None and (
-            not isinstance(identity_token, str) or not IDENTITY_TOKEN_RE.fullmatch(identity_token)
-        ):
-            raise ApiError(400, "Invalid local chat identity.")
-        with _lock:
-            challenge = _challenges.pop(challenge_id, None)
-        if not challenge or challenge["expires"] <= time.time() or challenge["address"] != self.client_address[0]:
-            raise ApiError(401, "Sign-in expired. Try again.")
-        password = os.environ.get("CHAT_ACCESS_PASSWORD", "")
-        if not password or not os.environ.get("SESSION_SECRET"):
-            raise ApiError(503, "Server-side sign-in is not configured.")
-        key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), AUTH_SALT, AUTH_ITERATIONS)
-        expected = hmac.new(key, challenge["nonce"], hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(proof, expected):
-            with _lock:
-                _failed_logins.setdefault(challenge["address"], []).append(time.time())
-            raise ApiError(401, "Incorrect access password.")
-
-        sender_id = None
-        identity_key = _session_key(f"identity:{identity_token}") if identity_token else None
-        with _lock:
-            if identity_key:
-                sender_id = _identities.get(identity_key)
-            if not sender_id and isinstance(previous_token, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", previous_token):
-                previous = _sessions.get(_session_key(previous_token))
-                if previous:
-                    sender_id = previous["sender_id"]
-        if not sender_id:
-            sender_id = _create_anonymous_user()
-        if identity_key:
-            with _lock:
-                sender_id = _identities.setdefault(identity_key, sender_id)
+    def _create_api_session(self):
+        access_token = self._read_body().get("supabaseAccessToken")
+        if not isinstance(access_token, str) or not re.fullmatch(r"[A-Za-z0-9._-]{64,8192}", access_token):
+            raise ApiError(401, "Account sign-in failed. Check your email and password.")
+        if not os.environ.get("SESSION_SECRET") or not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
+            raise ApiError(503, "Server-side sessions are not configured.")
+        sender_id = _supabase_auth_user(access_token)
         token = secrets.token_urlsafe(32)
         session_key = _session_key(token)
         expires = time.time() + SESSION_TTL
         with _lock:
             _sessions[session_key] = {"sender_id": sender_id, "expires": expires}
-            _failed_logins.pop(challenge["address"], None)
         self._send_json(200, {"token": token, "expiresAt": int(expires)})
 
     def _logout(self):

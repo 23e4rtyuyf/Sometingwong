@@ -1,10 +1,10 @@
 ---
 name: Chat identity across sign-ins
-description: The private chat uses a stable per-browser sender identity while retaining password-gated anonymous sessions.
+description: Supabase Auth accounts provide stable sender identity while chat encryption uses a separate shared passphrase.
 ---
 
-Keep a random identity token in the browser and map its server-side hash to the same Supabase anonymous user. Reuse the existing session table for this mapping, and reject far-future identity rows as bearer sessions.
+Use the Supabase Auth account UUID as the stable sender identity. Account email/password authenticates the user; keep the shared chat-encryption passphrase separate and never send it to the chat API. Exchange the Supabase access token for a short-lived app session without persisting the Supabase token in the browser. Provision confirmed accounts through the Supabase dashboard, and disable public sign-ups when access should be limited to accounts added by the owner.
 
-**Why:** Password-only sign-ins create a new anonymous user each time, which hides Delete on that user's earlier messages. The mapping avoids a database schema change and does not treat a nickname as proof of ownership.
+**Why:** Users need durable ownership across devices without exposing the shared encryption passphrase to the server. This does not require a new database table. Messages created under the old anonymous-user identities are not automatically owned by the new account UUID.
 
-**How to apply:** Only resolve the identity after the password proof succeeds. Keep the identity token separate from the short-lived API bearer token, and update the browser, Edge Function, and local development server together if the identity mechanism changes.
+**How to apply:** Keep browser sign-in, Edge Function token verification, and the local server aligned. Reject anonymous Supabase users from app sessions and verify ownership behavior before migrating any legacy messages.
