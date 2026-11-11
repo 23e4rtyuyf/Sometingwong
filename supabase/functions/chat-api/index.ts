@@ -6,6 +6,8 @@ const CHALLENGE_TTL_SECONDS = 90;
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const MAX_BODY_BYTES = 32_000;
 const MAX_MESSAGES = 500;
+const ROOM_JOIN_FAILURE_WINDOW_SECONDS = 15 * 60;
+const MAX_ROOM_JOIN_FAILURES = 8;
 const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const IDENTITY_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const encoder = new TextEncoder();
@@ -133,9 +135,11 @@ async function hashForStorage(secret, value) {
 }
 
 function clientAddress(request) {
+  const cloudflareAddress = request.headers.get("cf-connecting-ip") || "";
+  if (cloudflareAddress.trim()) return cloudflareAddress.trim();
   const forwarded = request.headers.get("x-forwarded-for") || "";
-  const firstForwarded = forwarded.split(",")[0].trim();
-  return firstForwarded || request.headers.get("cf-connecting-ip") || "unknown";
+  const forwardedAddresses = forwarded.split(",").map((value) => value.trim()).filter(Boolean);
+  return forwardedAddresses.at(-1) || "unknown";
 }
 
 async function readJson(request) {
@@ -222,6 +226,47 @@ async function cleanupExpiredRows() {
       prefer: "return=minimal",
     }),
   ]);
+}
+
+async function roomJoinFailureHashes(request, senderId) {
+  const settings = config();
+  const address = clientAddress(request);
+  const hashes = [];
+  if (address !== "unknown") {
+    hashes.push(await hashForStorage(settings.sessionSecret, `room-join-ip:${address}`));
+  }
+  hashes.push(await hashForStorage(settings.sessionSecret, `room-join-user:${senderId}`));
+  return hashes;
+}
+
+async function assertRoomJoinAllowed(request, senderId) {
+  const hashes = await roomJoinFailureHashes(request, senderId);
+  const cutoff = new Date(
+    Date.now() - ROOM_JOIN_FAILURE_WINDOW_SECONDS * 1000,
+  ).toISOString();
+  for (const addressHash of hashes) {
+    const failures = await supabaseRequest("chat_api_failed_logins", {
+      select: "attempt_id",
+      address_hash: `eq.${addressHash}`,
+      attempted_at: `gt.${cutoff}`,
+      limit: String(MAX_ROOM_JOIN_FAILURES),
+    });
+    if (Array.isArray(failures) && failures.length >= MAX_ROOM_JOIN_FAILURES) {
+      throw new ApiError(429, "Too many incorrect chat codes. Try again later.");
+    }
+  }
+  return hashes;
+}
+
+async function recordRoomJoinFailure(hashes) {
+  await Promise.all(hashes.map((addressHash) => supabaseRequest("chat_api_failed_logins", {}, {
+    method: "POST",
+    body: {
+      attempt_id: encodeBase64Url(randomBytes(18)),
+      address_hash: addressHash,
+    },
+    prefer: "return=minimal",
+  })));
 }
 
 async function issueChallenge(request) {
@@ -528,8 +573,12 @@ async function joinRoom(request) {
   if (typeof roomCode !== "string" || !/^[0-9]{6}$/.test(roomCode)) {
     throw new ApiError(400, "Enter a valid 6-digit room code.");
   }
+  const failureHashes = await assertRoomJoinAllowed(request, session.sender_id);
   const room = await findRoom(roomCode);
-  if (!room) throw new ApiError(404, "Chat not found. Check the room code.");
+  if (!room) {
+    await recordRoomJoinFailure(failureHashes);
+    throw new ApiError(404, "Chat not found. Check the room code.");
+  }
   await addRoomMember(roomCode, session.sender_id);
   return { roomCode, roomName: room.room_name };
 }

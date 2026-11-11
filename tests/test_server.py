@@ -47,6 +47,7 @@ class ServerApiTests(unittest.TestCase):
             server._sessions.clear()
             server._identities.clear()
             server._failed_logins.clear()
+            server._room_join_failures.clear()
         self.saved_message = None
         self.messages = [{
             "id": 1,
@@ -254,6 +255,16 @@ class ServerApiTests(unittest.TestCase):
         self.assertNotEqual(first_token, second_token)
         self.assertEqual(first_sender, TEST_SENDER_ID)
         self.assertEqual(second_sender, TEST_SENDER_ID)
+
+    def test_room_code_guessing_is_rate_limited(self):
+        token = self.sign_in()
+        for attempt in range(server.MAX_ROOM_JOIN_FAILURES):
+            status_code, _ = self.join_room(token, room_code=f"{900000 + attempt:06d}")
+            self.assertEqual(status_code, 404)
+
+        status_code, payload = self.join_room(token, room_code="999999")
+        self.assertEqual(status_code, 429)
+        self.assertIn("Too many incorrect", payload["error"])
 
     def test_message_history_uses_stable_pages(self):
         token = self.sign_in()

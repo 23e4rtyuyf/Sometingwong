@@ -26,6 +26,8 @@ CHALLENGE_TTL = 90
 SESSION_TTL = 8 * 60 * 60
 MAX_BODY_BYTES = 32_000
 MAX_MESSAGES = 500
+ROOM_JOIN_FAILURE_WINDOW = 15 * 60
+MAX_ROOM_JOIN_FAILURES = 8
 IDENTITY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 CURSOR_TIMESTAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$")
 ROOM_RE = re.compile(r"^[0-9]{6}$")
@@ -51,6 +53,7 @@ _challenges = {}
 _sessions = {}
 _identities = {}
 _failed_logins = {}
+_room_join_failures = {}
 
 
 class ApiError(Exception):
@@ -443,8 +446,34 @@ class SiteHandler(BaseHTTPRequestHandler):
         room = body.get("roomCode")
         if not isinstance(room, str) or not ROOM_RE.fullmatch(room):
             raise ApiError(400, "Enter a valid 6-digit room code.")
+        now = time.time()
+        keys = [
+            ("ip", self.client_address[0]),
+            ("sender", session["sender_id"]),
+        ]
+        with _lock:
+            for key, stamps in list(_room_join_failures.items()):
+                recent = [
+                    stamp for stamp in stamps
+                    if now - stamp < ROOM_JOIN_FAILURE_WINDOW
+                ]
+                if recent:
+                    _room_join_failures[key] = recent
+                else:
+                    _room_join_failures.pop(key, None)
+            for key in keys:
+                attempts = [
+                    stamp for stamp in _room_join_failures.get(key, [])
+                    if now - stamp < ROOM_JOIN_FAILURE_WINDOW
+                ]
+                _room_join_failures[key] = attempts
+                if len(attempts) >= MAX_ROOM_JOIN_FAILURES:
+                    raise ApiError(429, "Too many incorrect chat codes. Try again later.")
         room_info = self._find_room(room)
         if not room_info:
+            with _lock:
+                for key in keys:
+                    _room_join_failures.setdefault(key, []).append(now)
             raise ApiError(404, "Chat not found. Check the room code.")
         self._add_room_member(room, session["sender_id"])
         self._send_json(200, {"roomCode": room, "roomName": room_info["room_name"]})

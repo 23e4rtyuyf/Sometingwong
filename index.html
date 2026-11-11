@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://iozdwksqfhlhcrbhrwfl.supabase.co; object-src 'none'; base-uri 'self'; form-action 'self'; upgrade-insecure-requests">
   <title>Private Live Chat v2</title>
   <link rel="icon" href="attached_assets/generated_images/private-messages-mark.svg" type="image/svg+xml">
   <script src="api-config.js?v=5"></script>
@@ -193,7 +195,7 @@
     <button id="classicTab" type="button">Encrypt / decrypt</button>
   </nav>
   </header>
-  <p class="small">Your last room and recent encrypted messages are saved on this device. Your password is never saved.</p>
+  <p class="small">Encrypted chat history is saved on this device after it syncs. The app does not store your access password.</p>
 
   <section id="chatPage">
   <div class="intro">
