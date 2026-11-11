@@ -46,6 +46,11 @@
     .intro { max-width:660px; margin:1.2rem 0 1.6rem; }
     .intro h2 { margin:0 0 .35rem; font-size:clamp(1.5rem,4vw,2rem); letter-spacing:-.03em; }
     .room-setup { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:1rem; max-width:850px; }
+    .chat-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:.65rem; max-width:850px; margin:0 0 1rem; }
+    .chat-list button { display:flex; align-items:center; justify-content:space-between; gap:.7rem; width:100%; margin:0; padding:.8rem 1rem; background:#fff; color:var(--ink); text-align:left; border:1px solid var(--line); box-shadow:0 2px 8px #23416a08; }
+    .chat-list button:hover { background:#f7faff; border-color:#a8bee0; }
+    .chat-list small { color:var(--muted); font-weight:400; }
+    .chat-list-empty { grid-column:1/-1; margin:0; padding:.85rem 1rem; color:var(--muted); border:1px dashed var(--line); border-radius:12px; }
     .card { border:1px solid var(--line); border-radius:15px; padding:1.25rem; background:#fff; box-shadow:0 4px 18px #23416a08; }
     .card h2 { margin:0 0 .25rem; font-size:1.12rem; }
     .card .small { margin-bottom:.8rem; }
@@ -187,6 +192,23 @@
       </div>
     </form>
   </dialog>
+  <dialog id="accountDialog" aria-labelledby="accountDialogTitle">
+    <form id="accountForm">
+      <h2 id="accountDialogTitle">Add an account</h2>
+      <p class="small">Create a login for someone you trust. They can sign in without a verification email.</p>
+      <label for="newAccountName">Display name</label>
+      <input id="newAccountName" maxlength="40" required autocomplete="off">
+      <label for="newAccountEmail">Account email</label>
+      <input id="newAccountEmail" type="email" maxlength="254" required autocomplete="off">
+      <label for="newAccountPassword">Temporary password</label>
+      <input id="newAccountPassword" type="password" minlength="8" maxlength="128" required autocomplete="new-password">
+      <p id="accountStatus" class="status" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button id="cancelAccount" class="secondary" type="button">Cancel</button>
+        <button id="createAccount" type="submit">Create account</button>
+      </div>
+    </form>
+  </dialog>
   <section id="protectedApp" class="hidden">
   <div class="app-shell">
   <header class="app-top">
@@ -197,6 +219,7 @@
   <nav>
     <button id="chatTab" class="active" type="button">Chats</button>
     <button id="classicTab" type="button">Encrypt / decrypt</button>
+    <button id="manageAccounts" class="secondary" type="button" hidden>Add account</button>
   </nav>
   </header>
   <p class="small">Chat history is saved on this device after it syncs. The app does not store your account password or access password.</p>
@@ -207,6 +230,7 @@
     <p class="small">Start a room or join someone with their six-digit code.</p>
   </div>
   <div id="rooms">
+    <div id="chatList" class="chat-list" aria-live="polite"></div>
     <div class="room-setup">
     <div class="card">
       <h2>Create a room</h2>
@@ -269,7 +293,7 @@
               <button id="editRoomName" type="button">Rename chat</button>
               <button id="copyRoomCode" type="button">Copy room code</button>
               <button id="refresh" type="button">Refresh messages</button>
-              <button id="leave" class="danger" type="button">Leave chat</button>
+              <button id="leave" type="button">Back to chats</button>
             </div>
           </details>
         </header>
@@ -314,6 +338,7 @@ let showingCachedHistory = false;
 let apiToken = '';
 let supabaseAccessToken = '';
 let accountDisplayName = '';
+let isAccountAdmin = false;
 let accessPassword = '';
 let profileSaveTimer = null;
 let profileSavePromise = Promise.resolve();
@@ -332,6 +357,8 @@ function lockForExpiredSession() {
   apiToken = '';
   supabaseAccessToken = '';
   accountDisplayName = '';
+  isAccountAdmin = false;
+  $('manageAccounts').hidden = true;
   accessPassword = '';
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
@@ -420,6 +447,32 @@ async function saveAccountDisplayName(name) {
   };
   profileSavePromise = profileSavePromise.catch(() => {}).then(save);
   return profileSavePromise;
+}
+async function refreshRoomList() {
+  const result = await apiRequest('/api/rooms');
+  const list = $('chatList');
+  list.replaceChildren();
+  if (!Array.isArray(result.rooms) || result.rooms.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'chat-list-empty';
+    empty.textContent = 'No chats yet. Create one or join with a room code.';
+    list.append(empty);
+    return;
+  }
+  for (const room of result.rooms) {
+    if (!room || !/^\d{6}$/.test(room.roomCode || '')) continue;
+    const button = document.createElement('button');
+    button.type = 'button';
+    const name = document.createElement('span');
+    name.textContent = room.roomName || `Room ${room.roomCode}`;
+    const code = document.createElement('small');
+    code.textContent = room.roomCode;
+    button.append(name, code);
+    button.addEventListener('click', () => {
+      enterRoom(room.roomCode, $('profileName').value);
+    });
+    list.append(button);
+  }
 }
 function openHistoryDatabase() {
   if (!window.indexedDB) return Promise.reject(new Error('This browser does not support local chat history.'));
@@ -631,6 +684,8 @@ $('accessForm').addEventListener('submit', async (event) => {
   try {
     const account = await signInWithAccount(email, accountPassword);
     supabaseAccessToken = account.access_token;
+    isAccountAdmin = account.user?.app_metadata?.chat_admin === true;
+    $('manageAccounts').hidden = !isAccountAdmin;
     const accountName = typeof account.user?.user_metadata?.display_name === 'string'
       ? account.user.user_metadata.display_name.trim().slice(0, 40)
       : '';
@@ -638,6 +693,7 @@ $('accessForm').addEventListener('submit', async (event) => {
       || savedProfile.accountId === account.user?.id;
     accountDisplayName = accountName;
     const startingName = accountName || (localNameBelongsToAccount ? savedProfile.name : '') || '';
+    if (!localNameBelongsToAccount) savedProfile.room = '';
     savedProfile.accountId = account.user?.id || '';
     $('profileName').value = startingName;
     savedProfile.name = startingName;
@@ -669,6 +725,11 @@ $('accessForm').addEventListener('submit', async (event) => {
     showPage('chat');
     $('rooms').classList.remove('hidden');
     $('chat').classList.add('hidden');
+    try {
+      await refreshRoomList();
+    } catch (error) {
+      status(`Could not load your saved chats: ${error.message}`);
+    }
     if (savedProfile.room && savedProfile.name) {
       await enterRoom(savedProfile.room, savedProfile.name);
     }
@@ -1014,6 +1075,11 @@ async function enterRoom(code, name) {
   nickname = requestedName;
   activeRoomName = roomInfo.roomName;
   saveProfile();
+  try {
+    await refreshRoomList();
+  } catch (error) {
+    status(`Chat opened, but the chat list could not refresh: ${error.message}`);
+  }
   $('roomCode').textContent = `Code ${roomCode}`;
   $('identity').textContent = `You are ${nickname}`;
   updateRoomHeading();
@@ -1067,6 +1133,44 @@ $('createRoom').addEventListener('click', async () => {
   }
 });
 $('joinRoom').addEventListener('click', () => enterRoom($('joinCode').value, $('profileName').value));
+$('manageAccounts').addEventListener('click', () => {
+  if (!isAccountAdmin) return;
+  $('accountStatus').textContent = '';
+  $('accountDialog').showModal();
+  $('newAccountName').focus();
+});
+$('cancelAccount').addEventListener('click', () => {
+  $('accountForm').reset();
+  $('accountDialog').close();
+});
+$('accountForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!isAccountAdmin || !supabaseAccessToken) {
+    $('accountStatus').textContent = 'Only an approved account administrator can add accounts.';
+    return;
+  }
+  const button = $('createAccount');
+  button.disabled = true;
+  $('accountStatus').textContent = 'Creating account…';
+  try {
+    const result = await apiRequest('/api/admin/accounts', {
+      method: 'POST',
+      body: JSON.stringify({
+        displayName: $('newAccountName').value.trim(),
+        email: $('newAccountEmail').value.trim(),
+        password: $('newAccountPassword').value,
+        supabaseAccessToken,
+      }),
+    });
+    $('accountForm').reset();
+    $('accountDialog').close();
+    status(`Account created for ${result.email}. Share the login details privately.`);
+  } catch (error) {
+    $('accountStatus').textContent = error.message || 'Could not create the account.';
+  } finally {
+    button.disabled = false;
+  }
+});
 $('loadOlder').addEventListener('click', loadOlderMessages);
 $('editRoomName').addEventListener('click', () => {
   $('roomNameInput').value = activeRoomName;
@@ -1092,6 +1196,7 @@ $('roomNameForm').addEventListener('submit', async (event) => {
     });
     activeRoomName = result.roomName;
     updateRoomHeading();
+    try { await refreshRoomList(); } catch { /* Keep the renamed room open if the list cannot refresh. */ }
     $('roomNameDialog').close();
     status('Chat name updated for everyone in this room.');
   } catch (error) {
@@ -1176,7 +1281,7 @@ $('leave').addEventListener('click', () => {
   savedProfile.room = '';
   localStorage.setItem(PROFILE_KEY, JSON.stringify(savedProfile));
   $('joinCode').value = '';
-  showPage('chat'); status('Left room.');
+  showPage('chat'); status('Back to your chats.');
 });
 $('chatTab').addEventListener('click', () => showPage('chat'));
 $('classicTab').addEventListener('click', () => showPage('classic'));

@@ -2,5 +2,6 @@
 - [PostgreSQL target selection](postgresql-target-selection.md) — Use an explicit target; ambient Replit PostgreSQL settings can select the local database.
 - [Supabase function URL slugs](supabase-function-url-slugs.md) — Use the copied endpoint URL; a Dashboard display name may not rename its deployed slug.
 - [Chat identity across sign-ins](chat-identity-across-signins.md) — Supabase Auth accounts own new messages; the shared encryption passphrase stays separate.
+- [Chat account administrators](chat-account-administrators.md) — Only a server-verified Supabase app_metadata flag can authorize creating confirmed chat accounts.
 - [Room-code guessing limits](room-code-guessing-limits.md) — Throttle invalid room-code attempts, but treat six-digit codes as a temporary convenience rather than strong access control.
 - [Temporary validation runtimes](temporary-validation-runtimes.md) — One-off Node checks can auto-add a runtime; remove unintended modules through package management.

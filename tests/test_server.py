@@ -86,6 +86,11 @@ class ServerApiTests(unittest.TestCase):
                 return [dict(room)] if prefer == "return=representation" else None
         if table == "chat_api_room_members":
             if method == "GET":
+                if not room_code:
+                    return [
+                        {"room_code": code, "joined_at": "2026-11-11T12:00:00Z"}
+                        for code, member in self.members if member == sender_id
+                    ]
                 return [{"room_code": room_code}] if (room_code, sender_id) in self.members else []
             if method == "POST":
                 self.members.add((body["room_code"], body["sender_id"]))
@@ -411,6 +416,77 @@ class ServerApiTests(unittest.TestCase):
         )
         self.assertEqual(status_code, 200)
         self.assertEqual(chat["roomName"], "Science club")
+
+    def test_signed_in_user_can_list_all_their_chats(self):
+        token = self.sign_in()
+        status_code, created = self.request(
+            "/api/rooms",
+            method="POST",
+            token=token,
+            payload={"roomName": "Study group"},
+        )
+        self.assertEqual(status_code, 201)
+        joined_status, _ = self.join_room(token, "123456")
+        self.assertEqual(joined_status, 200)
+
+        status_code, result = self.request("/api/rooms", token=token)
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(
+            {(room["roomCode"], room["roomName"]) for room in result["rooms"]},
+            {(created["roomCode"], "Study group"), ("123456", "Room 123456")},
+        )
+
+    def test_only_admin_can_create_confirmed_account(self):
+        token = self.sign_in()
+        with patch.object(server, "_supabase_auth_user_details", return_value={
+            "id": TEST_SENDER_ID,
+            "app_metadata": {"chat_admin": True},
+        }), patch.object(server, "_supabase_request", return_value={"id": "new-user-id"}) as create_user:
+            status_code, result = self.request(
+                "/api/admin/accounts",
+                method="POST",
+                token=token,
+                payload={
+                    "supabaseAccessToken": TEST_SUPABASE_ACCESS_TOKEN,
+                    "displayName": "New friend",
+                    "email": "friend@example.com",
+                    "password": "a-strong-test-password",
+                },
+            )
+
+        self.assertEqual(status_code, 201)
+        self.assertEqual(result, {
+            "ok": True,
+            "email": "friend@example.com",
+            "displayName": "New friend",
+        })
+        call = create_user.call_args
+        self.assertEqual(call.args[0], "/auth/v1/admin/users")
+        self.assertEqual(call.kwargs["body"]["email_confirm"], True)
+        self.assertEqual(call.kwargs["body"]["user_metadata"], {"display_name": "New friend"})
+
+    def test_non_admin_cannot_create_accounts(self):
+        token = self.sign_in()
+        with patch.object(server, "_supabase_auth_user_details", return_value={
+            "id": TEST_SENDER_ID,
+            "app_metadata": {"chat_admin": False},
+        }), patch.object(server, "_supabase_request") as create_user:
+            status_code, payload = self.request(
+                "/api/admin/accounts",
+                method="POST",
+                token=token,
+                payload={
+                    "supabaseAccessToken": TEST_SUPABASE_ACCESS_TOKEN,
+                    "displayName": "New friend",
+                    "email": "friend@example.com",
+                    "password": "a-strong-test-password",
+                },
+            )
+
+        self.assertEqual(status_code, 403)
+        self.assertIn("administrator", payload["error"])
+        create_user.assert_not_called()
 
     def test_room_membership_is_required_for_messages_and_renaming(self):
         token = self.sign_in()

@@ -112,7 +112,7 @@ def _supabase_request(path, method="GET", body=None, query=None, prefer="return=
         raise ApiError(502, "Chat storage is temporarily unavailable.")
 
 
-def _supabase_auth_user(access_token):
+def _supabase_auth_user_details(access_token):
     request = Request(
         f"{SUPABASE_URL}/auth/v1/user",
         headers={
@@ -137,7 +137,11 @@ def _supabase_auth_user(access_token):
         user_id,
     )):
         raise ApiError(401, "Account sign-in failed. Check your email and password.")
-    return user_id
+    return payload
+
+
+def _supabase_auth_user(access_token):
+    return _supabase_auth_user_details(access_token)["id"]
 
 
 class SiteHandler(BaseHTTPRequestHandler):
@@ -222,6 +226,9 @@ class SiteHandler(BaseHTTPRequestHandler):
             return
         try:
             self._require_origin()
+            if path.path == "/api/rooms":
+                self._list_rooms()
+                return
             if path.path == "/api/messages":
                 self._read_messages(parse_qs(path.query))
                 return
@@ -247,6 +254,9 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/rooms/rename":
                 self._rename_room()
+                return
+            if path == "/api/admin/accounts":
+                self._create_account()
                 return
             if path == "/api/messages":
                 self._insert_message()
@@ -310,6 +320,60 @@ class SiteHandler(BaseHTTPRequestHandler):
             "limit": "1",
         })
         return rows[0] if isinstance(rows, list) and rows else None
+
+    def _list_rooms(self):
+        session = self._require_session()
+        memberships = _supabase_request("/rest/v1/chat_api_room_members", query={
+            "select": "room_code,joined_at",
+            "sender_id": f"eq.{session['sender_id']}",
+            "order": "joined_at.desc",
+            "limit": "100",
+        })
+        if not isinstance(memberships, list):
+            raise ApiError(502, "Chat storage returned an invalid room list.")
+        rooms = []
+        for membership in memberships:
+            code = membership.get("room_code") if isinstance(membership, dict) else ""
+            if not isinstance(code, str) or not ROOM_RE.fullmatch(code):
+                continue
+            room = self._find_room(code)
+            if room:
+                rooms.append({"roomCode": code, "roomName": room["room_name"]})
+        self._send_json(200, {"rooms": rooms})
+
+    def _create_account(self):
+        session = self._require_session()
+        body = self._read_body()
+        access_token = body.get("supabaseAccessToken")
+        if not isinstance(access_token, str) or not re.fullmatch(r"[A-Za-z0-9._-]{64,8192}", access_token):
+            raise ApiError(401, "Sign in again before adding an account.")
+        user = _supabase_auth_user_details(access_token)
+        if user.get("id") != session["sender_id"]:
+            raise ApiError(403, "This account cannot manage other accounts.")
+        app_metadata = user.get("app_metadata")
+        if not isinstance(app_metadata, dict) or app_metadata.get("chat_admin") is not True:
+            raise ApiError(403, "Only an approved account administrator can add accounts.")
+        email = body.get("email")
+        if not isinstance(email, str):
+            raise ApiError(400, "Enter a valid email address.")
+        email = email.strip().lower()
+        if len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise ApiError(400, "Enter a valid email address.")
+        password = body.get("password")
+        if not isinstance(password, str) or not 8 <= len(password) <= 128:
+            raise ApiError(400, "Use a password between 8 and 128 characters.")
+        display_name = body.get("displayName")
+        if not isinstance(display_name, str) or not NAME_RE.fullmatch(display_name.strip()):
+            raise ApiError(400, "Enter a display name between 1 and 40 characters.")
+        created = _supabase_request("/auth/v1/admin/users", method="POST", body={
+            "email": email,
+            "password": password,
+            "email_confirm": True,
+            "user_metadata": {"display_name": display_name.strip()},
+        })
+        if not isinstance(created, dict) or not created.get("id"):
+            raise ApiError(502, "Supabase did not confirm the account was created.")
+        self._send_json(201, {"ok": True, "email": email, "displayName": display_name.strip()})
 
     def _add_room_member(self, room, sender_id):
         _supabase_request(

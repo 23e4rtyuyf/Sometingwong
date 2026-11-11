@@ -255,7 +255,7 @@ async function recordRoomJoinFailure(hashes) {
   })));
 }
 
-async function supabaseUserIdFromAccessToken(accessToken) {
+async function supabaseUserFromAccessToken(accessToken) {
   const settings = config();
   if (!settings.publishableKey) {
     throw new ApiError(503, "Account sign-in is not configured.");
@@ -280,6 +280,11 @@ async function supabaseUserIdFromAccessToken(accessToken) {
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(user.id)) {
     throw new ApiError(401, "Account sign-in failed. Check your email and password.");
   }
+  return user;
+}
+
+async function supabaseUserIdFromAccessToken(accessToken) {
+  const user = await supabaseUserFromAccessToken(accessToken);
   return user.id;
 }
 
@@ -344,6 +349,26 @@ async function findRoom(roomCode) {
     limit: "1",
   });
   return Array.isArray(rows) ? rows[0] || null : null;
+}
+
+async function listRooms(request) {
+  const session = await requireSession(request);
+  const memberships = await supabaseRequest("chat_api_room_members", {
+    select: "room_code,joined_at",
+    sender_id: `eq.${session.sender_id}`,
+    order: "joined_at.desc",
+    limit: "100",
+  });
+  if (!Array.isArray(memberships)) {
+    throw new ApiError(502, "Chat storage returned an invalid room list.");
+  }
+  const rooms = await Promise.all(memberships.map(async (membership) => {
+    const roomCode = membership?.room_code;
+    if (typeof roomCode !== "string" || !/^[0-9]{6}$/.test(roomCode)) return null;
+    const room = await findRoom(roomCode);
+    return room ? { roomCode, roomName: room.room_name } : null;
+  }));
+  return { rooms: rooms.filter(Boolean) };
 }
 
 async function addRoomMember(roomCode, senderId) {
@@ -427,6 +452,72 @@ async function renameRoom(request) {
     prefer: "return=minimal",
   });
   return { roomCode, roomName };
+}
+
+async function createAccount(request) {
+  const session = await requireSession(request);
+  const body = await readJson(request);
+  const accessToken = typeof body.supabaseAccessToken === "string"
+    ? body.supabaseAccessToken
+    : "";
+  if (!/^[A-Za-z0-9._-]{64,8192}$/.test(accessToken)) {
+    throw new ApiError(401, "Sign in again before adding an account.");
+  }
+  const user = await supabaseUserFromAccessToken(accessToken);
+  if (user.id !== session.sender_id
+    || !user.app_metadata
+    || user.app_metadata.chat_admin !== true) {
+    throw new ApiError(403, "Only an approved account administrator can add accounts.");
+  }
+  const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+  if (email.length > 254 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    throw new ApiError(400, "Enter a valid email address.");
+  }
+  const password = body.password;
+  if (typeof password !== "string" || password.length < 8 || password.length > 128) {
+    throw new ApiError(400, "Use a password between 8 and 128 characters.");
+  }
+  const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
+  if (!/^[^\x00-\x1f\x7f]{1,40}$/.test(displayName)) {
+    throw new ApiError(400, "Enter a display name between 1 and 40 characters.");
+  }
+  const settings = config();
+  if (!settings.serviceKey) {
+    throw new ApiError(503, "Account creation is not configured on the server.");
+  }
+  let response;
+  try {
+    response = await fetch(`${settings.supabaseUrl}/auth/v1/admin/users`, {
+      method: "POST",
+      headers: {
+        apikey: settings.serviceKey,
+        Authorization: `Bearer ${settings.serviceKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        email,
+        password,
+        email_confirm: true,
+        user_metadata: { display_name: displayName },
+      }),
+      cache: "no-store",
+    });
+  } catch {
+    throw new ApiError(502, "Could not reach account storage.");
+  }
+  if (!response.ok) {
+    console.error(`[chat-api] Supabase account creation failed with status ${response.status}.`);
+    if ([400, 409, 422].includes(response.status)) {
+      throw new ApiError(400, "Could not create the account. Check the email, password rules, or whether the email is already used.");
+    }
+    throw new ApiError(502, "Account storage could not create the account.");
+  }
+  const created = await response.json().catch(() => ({}));
+  if (typeof created?.id !== "string") {
+    throw new ApiError(502, "Supabase did not confirm the account was created.");
+  }
+  return { ok: true, email, displayName };
 }
 
 async function logout(request) {
@@ -575,11 +666,17 @@ async function handle(request) {
     if (request.method === "POST" && route === "/api/rooms") {
       return jsonResponse(request, 201, await createRoom(request));
     }
+    if (request.method === "GET" && route === "/api/rooms") {
+      return jsonResponse(request, 200, await listRooms(request));
+    }
     if (request.method === "POST" && route === "/api/rooms/join") {
       return jsonResponse(request, 200, await joinRoom(request));
     }
     if (request.method === "POST" && route === "/api/rooms/rename") {
       return jsonResponse(request, 200, await renameRoom(request));
+    }
+    if (request.method === "POST" && route === "/api/admin/accounts") {
+      return jsonResponse(request, 201, await createAccount(request));
     }
     if (request.method === "GET" && route === "/api/messages") {
       return jsonResponse(request, 200, await readMessages(request));
