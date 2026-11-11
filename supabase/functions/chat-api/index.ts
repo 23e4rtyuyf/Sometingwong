@@ -75,6 +75,12 @@ function routeFromUrl(rawUrl) {
     const routeIndex = functionPath.indexOf("/");
     return routeIndex >= 0 ? functionPath.slice(routeIndex) || "/" : "/";
   }
+  // Some gateways rewrite the forwarded path but leave the function slug in
+  // front of the application route, for example /swift-endpoint/api/health.
+  const apiIndex = pathname.indexOf("/api/");
+  if (apiIndex >= 0) {
+    return pathname.slice(apiIndex);
+  }
   return pathname;
 }
 
