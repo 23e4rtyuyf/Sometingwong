@@ -22,29 +22,26 @@ or writable only after the current session joins that room.
 In Supabase Dashboard, open **Edge Functions → Secrets** and set:
 
 - `SESSION_SECRET`
+- `CHAT_ADMIN_EMAILS`
 
-Use the same `SESSION_SECRET` value currently stored in Replit Secrets. Enter it
-only in Supabase's secret form, never in this repository or chat. Supabase
-injects its project URL, publishable key, and service-role key into the function
-runtime; the service-role key must never be placed in GitHub Pages.
+Use the same `SESSION_SECRET` value currently stored in Replit Secrets. Set
+`CHAT_ADMIN_EMAILS` to the comma-separated exact email addresses allowed to add
+accounts. Keep these addresses in the secret settings, not in this public
+repository. Add the same `CHAT_ADMIN_EMAILS` secret in Replit if using the local
+Python server. Supabase injects its project URL, publishable key, and
+service-role key into the function runtime; the service-role key must never be
+placed in GitHub Pages.
 
-## 3. Approve account administrators
+## 3. Restrict account administrators
 
-Only accounts marked as administrators can create additional accounts. To mark
-your own account, replace `YOUR_ACCOUNT_EMAIL` with the email you use to sign
-in, then run this once in the Supabase SQL Editor:
+Only email addresses in `CHAT_ADMIN_EMAILS` can create additional accounts.
+The function checks this list server-side both when signing in and when adding
+an account. No database change is needed to set administrators. Keep the list
+limited to the exact accounts you intend to authorize.
 
-```sql
-update auth.users
-set raw_app_meta_data =
-  coalesce(raw_app_meta_data, '{}'::jsonb) || '{"chat_admin": true}'::jsonb
-where lower(email) = lower('YOUR_ACCOUNT_EMAIL');
-```
-
-The result should report one updated row. Sign out and sign in again. The
-**Add account** button will appear. New accounts are created as confirmed users
-and do not receive a verification email. Share their temporary passwords
-privately. Do not grant this administrator flag to regular accounts.
+After saving the secret, sign in again. The **Add account** button will appear
+for an allowlisted account. New accounts are created as confirmed users and do
+not receive a verification email. Share their temporary passwords privately.
 
 ## 4. Deploy the function
 

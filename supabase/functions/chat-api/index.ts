@@ -30,7 +30,14 @@ function config() {
     serviceKey: Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || envJsonKey("SUPABASE_SECRET_KEYS"),
     publishableKey: Deno.env.get("SUPABASE_ANON_KEY") || envJsonKey("SUPABASE_PUBLISHABLE_KEYS"),
     sessionSecret: Deno.env.get("SESSION_SECRET") || "",
+    adminEmails: new Set((Deno.env.get("CHAT_ADMIN_EMAILS") || "")
+      .split(",").map((email) => email.trim().toLowerCase()).filter(Boolean)),
   };
+}
+
+function isChatAdmin(user, settings = config()) {
+  return typeof user?.email === "string"
+    && settings.adminEmails.has(user.email.trim().toLowerCase());
 }
 
 function corsHeaders(request) {
@@ -283,11 +290,6 @@ async function supabaseUserFromAccessToken(accessToken) {
   return user;
 }
 
-async function supabaseUserIdFromAccessToken(accessToken) {
-  const user = await supabaseUserFromAccessToken(accessToken);
-  return user.id;
-}
-
 async function createApiSession(request) {
   const settings = config();
   if (!settings.sessionSecret || !settings.serviceKey) {
@@ -300,7 +302,8 @@ async function createApiSession(request) {
   if (!/^[A-Za-z0-9._-]{64,8192}$/.test(accessToken)) {
     throw new ApiError(401, "Account sign-in failed. Check your email and password.");
   }
-  const senderId = await supabaseUserIdFromAccessToken(accessToken);
+  const user = await supabaseUserFromAccessToken(accessToken);
+  const senderId = user.id;
   await cleanupExpiredRows();
   const token = encodeBase64Url(randomBytes(32));
   const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
@@ -310,7 +313,11 @@ async function createApiSession(request) {
     body: { token_hash: tokenHash, sender_id: senderId, expires_at: expiresAt },
     prefer: "return=minimal",
   });
-  return { token, expiresAt: Math.floor(Date.parse(expiresAt) / 1000) };
+  return {
+    token,
+    expiresAt: Math.floor(Date.parse(expiresAt) / 1000),
+    isAdmin: isChatAdmin(user, settings),
+  };
 }
 
 async function requireSession(request) {
@@ -464,9 +471,8 @@ async function createAccount(request) {
     throw new ApiError(401, "Sign in again before adding an account.");
   }
   const user = await supabaseUserFromAccessToken(accessToken);
-  if (user.id !== session.sender_id
-    || !user.app_metadata
-    || user.app_metadata.chat_admin !== true) {
+  const settings = config();
+  if (user.id !== session.sender_id || !isChatAdmin(user, settings)) {
     throw new ApiError(403, "Only an approved account administrator can add accounts.");
   }
   const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
@@ -481,7 +487,6 @@ async function createAccount(request) {
   if (!/^[^\x00-\x1f\x7f]{1,40}$/.test(displayName)) {
     throw new ApiError(400, "Enter a display name between 1 and 40 characters.");
   }
-  const settings = config();
   if (!settings.serviceKey) {
     throw new ApiError(503, "Account creation is not configured on the server.");
   }

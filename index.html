@@ -684,8 +684,8 @@ $('accessForm').addEventListener('submit', async (event) => {
   try {
     const account = await signInWithAccount(email, accountPassword);
     supabaseAccessToken = account.access_token;
-    isAccountAdmin = account.user?.app_metadata?.chat_admin === true;
-    $('manageAccounts').hidden = !isAccountAdmin;
+    isAccountAdmin = false;
+    $('manageAccounts').hidden = true;
     const accountName = typeof account.user?.user_metadata?.display_name === 'string'
       ? account.user.user_metadata.display_name.trim().slice(0, 40)
       : '';
@@ -716,6 +716,8 @@ $('accessForm').addEventListener('submit', async (event) => {
       body: JSON.stringify({ supabaseAccessToken: account.access_token })
     }, false);
     apiToken = session.token;
+    isAccountAdmin = session.isAdmin === true;
+    $('manageAccounts').hidden = !isAccountAdmin;
     accessPassword = candidate;
     $('accountPassword').value = '';
     $('accessPassword').value = '';

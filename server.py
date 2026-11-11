@@ -144,6 +144,18 @@ def _supabase_auth_user(access_token):
     return _supabase_auth_user_details(access_token)["id"]
 
 
+def _is_chat_admin(user):
+    email = user.get("email") if isinstance(user, dict) else None
+    if not isinstance(email, str):
+        return False
+    allowed = {
+        value.strip().lower()
+        for value in os.environ.get("CHAT_ADMIN_EMAILS", "").split(",")
+        if value.strip()
+    }
+    return email.strip().lower() in allowed
+
+
 class SiteHandler(BaseHTTPRequestHandler):
     server_version = "PrivateChat/2"
 
@@ -298,13 +310,15 @@ class SiteHandler(BaseHTTPRequestHandler):
             raise ApiError(401, "Account sign-in failed. Check your email and password.")
         if not os.environ.get("SESSION_SECRET") or not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
             raise ApiError(503, "Server-side sessions are not configured.")
-        sender_id = _supabase_auth_user(access_token)
+        user = _supabase_auth_user_details(access_token)
+        sender_id = user["id"]
+        is_admin = _is_chat_admin(user)
         token = secrets.token_urlsafe(32)
         session_key = _session_key(token)
         expires = time.time() + SESSION_TTL
         with _lock:
             _sessions[session_key] = {"sender_id": sender_id, "expires": expires}
-        self._send_json(200, {"token": token, "expiresAt": int(expires)})
+        self._send_json(200, {"token": token, "expiresAt": int(expires), "isAdmin": is_admin})
 
     def _logout(self):
         token = self.headers.get("Authorization", "").partition(" ")[2]
@@ -350,8 +364,7 @@ class SiteHandler(BaseHTTPRequestHandler):
         user = _supabase_auth_user_details(access_token)
         if user.get("id") != session["sender_id"]:
             raise ApiError(403, "This account cannot manage other accounts.")
-        app_metadata = user.get("app_metadata")
-        if not isinstance(app_metadata, dict) or app_metadata.get("chat_admin") is not True:
+        if not _is_chat_admin(user):
             raise ApiError(403, "Only an approved account administrator can add accounts.")
         email = body.get("email")
         if not isinstance(email, str):

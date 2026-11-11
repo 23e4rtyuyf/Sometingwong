@@ -36,6 +36,7 @@ class ServerApiTests(unittest.TestCase):
             "SESSION_SECRET": "test-session-secret-do-not-use",
             "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-do-not-use",
             "CHAT_ALLOWED_ORIGINS": ORIGIN,
+            "CHAT_ADMIN_EMAILS": "admin@example.com",
         }, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -55,7 +56,11 @@ class ServerApiTests(unittest.TestCase):
         self.legacy_room_codes = {"123456"}
         self.members = set()
         self.supabase = patch.object(server, "_supabase_request", side_effect=self.fake_supabase)
-        self.auth_user_patch = patch.object(server, "_supabase_auth_user", return_value=TEST_SENDER_ID)
+        self.auth_user_patch = patch.object(server, "_supabase_auth_user_details", return_value={
+            "id": TEST_SENDER_ID,
+            "email": "user@example.com",
+            "app_metadata": {},
+        })
         self.supabase.start()
         self.auth_user = self.auth_user_patch.start()
         self.addCleanup(self.supabase.stop)
@@ -247,6 +252,22 @@ class ServerApiTests(unittest.TestCase):
         self.assertNotEqual(first_token, second_token)
         self.assertEqual(first_sender, TEST_SENDER_ID)
         self.assertEqual(second_sender, TEST_SENDER_ID)
+
+    def test_only_allowlisted_email_gets_admin_session(self):
+        self.auth_user.return_value = {
+            "id": TEST_SENDER_ID,
+            "email": "ADMIN@example.com",
+            "app_metadata": {},
+        }
+
+        status_code, result = self.request(
+            "/api/auth/session",
+            method="POST",
+            payload={"supabaseAccessToken": TEST_SUPABASE_ACCESS_TOKEN},
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertTrue(result["isAdmin"])
 
     def test_room_code_guessing_is_rate_limited(self):
         token = self.sign_in()
@@ -441,7 +462,7 @@ class ServerApiTests(unittest.TestCase):
         token = self.sign_in()
         with patch.object(server, "_supabase_auth_user_details", return_value={
             "id": TEST_SENDER_ID,
-            "app_metadata": {"chat_admin": True},
+            "email": "admin@example.com",
         }), patch.object(server, "_supabase_request", return_value={"id": "new-user-id"}) as create_user:
             status_code, result = self.request(
                 "/api/admin/accounts",
@@ -470,7 +491,7 @@ class ServerApiTests(unittest.TestCase):
         token = self.sign_in()
         with patch.object(server, "_supabase_auth_user_details", return_value={
             "id": TEST_SENDER_ID,
-            "app_metadata": {"chat_admin": False},
+            "email": "not-admin@example.com",
         }), patch.object(server, "_supabase_request") as create_user:
             status_code, payload = self.request(
                 "/api/admin/accounts",
