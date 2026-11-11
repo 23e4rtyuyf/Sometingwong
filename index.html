@@ -132,12 +132,12 @@
       <button id="showTerms" class="secondary" type="button">Read Terms of Service</button>
       <p id="termsAcceptanceStatus" class="small">Review and accept the Terms before continuing.</p>
       <form id="accessForm">
-        <p class="small">Sign in with the account email and password provided by your administrator. No verification email is required.</p>
+        <p class="small">Sign in with the account email and password provided by your administrator, then enter your existing access password. No verification email is required.</p>
         <label for="accountEmail">Account email</label>
         <input id="accountEmail" type="email" autocomplete="username" required>
         <label for="accountPassword">Account password</label>
         <input id="accountPassword" type="password" autocomplete="current-password" required>
-        <label for="accessPassword">Chat encryption password</label>
+        <label for="accessPassword">Access password</label>
         <input id="accessPassword" type="password" autocomplete="off" required>
         <button id="unlock" type="submit" style="width:100%;margin-top:1rem">Sign in</button>
         <p id="accessStatus" class="status" role="status" aria-live="polite"></p>
@@ -199,7 +199,7 @@
     <button id="classicTab" type="button">Encrypt / decrypt</button>
   </nav>
   </header>
-  <p class="small">Encrypted chat history is saved on this device after it syncs. The app does not store your account or chat encryption password.</p>
+  <p class="small">Chat history is saved on this device after it syncs. The app does not store your account password or access password.</p>
 
   <section id="chatPage">
   <div class="intro">
@@ -312,7 +312,7 @@ let locallyDeletedMessageIds = new Set();
 let messagesInitialized = false;
 let showingCachedHistory = false;
 let apiToken = '';
-let encryptionSecret = '';
+let accessPassword = '';
 let activeRoomName = '';
 let termsAccepted = false;
 let savedProfile = {};
@@ -326,7 +326,7 @@ function status(message) { $('status').textContent = message; }
 function lockForExpiredSession() {
   if (!apiToken) return;
   apiToken = '';
-  encryptionSecret = '';
+  accessPassword = '';
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
   $('accessGate').classList.remove('hidden');
@@ -585,7 +585,7 @@ $('accessForm').addEventListener('submit', async (event) => {
     $('accountPassword').value = '';
     $('accessPassword').value = '';
     $('accountEmail').focus();
-    $('accessStatus').textContent = 'Enter your account details and chat encryption password.';
+    $('accessStatus').textContent = 'Enter your account details and access password.';
     return;
   }
   $('accessStatus').textContent = 'Signing in…';
@@ -596,7 +596,7 @@ $('accessForm').addEventListener('submit', async (event) => {
       body: JSON.stringify({ supabaseAccessToken })
     }, false);
     apiToken = session.token;
-    encryptionSecret = candidate;
+    accessPassword = candidate;
     $('accountPassword').value = '';
     $('accessPassword').value = '';
     $('accessStatus').textContent = '';
@@ -710,7 +710,7 @@ async function renderMessages(data, options = {}) {
     const output = document.createElement('div');
     output.className = 'message-body';
     try {
-      output.textContent = await decryptMessage(item.encrypted_text, encryptionSecret);
+      output.textContent = await decryptMessage(item.encrypted_text, accessPassword);
     } catch {
       output.textContent = 'Message unavailable.';
     }
@@ -1051,7 +1051,7 @@ $('profileName').addEventListener('input', () => {
   $('profileId').textContent = profile.id;
 });
 $('send').addEventListener('click', async () => {
-  const text = $('plain').value; const secret = encryptionSecret;
+  const text = $('plain').value; const secret = accessPassword;
   if (!text) { status('Write a message first.'); return; }
   if (!apiToken) { status('Sign in again before sending messages.'); return; }
   try {
@@ -1084,7 +1084,7 @@ $('chatTab').addEventListener('click', () => showPage('chat'));
 $('classicTab').addEventListener('click', () => showPage('classic'));
 $('classicEncrypt').addEventListener('click', async () => {
   const text = $('classicPlain').value;
-  const secret = encryptionSecret;
+  const secret = accessPassword;
   if (!text || !secret) { status('Write a message first.'); return; }
   try {
     $('classicOutput').value = await encryptMessage(text, secret);
@@ -1103,13 +1103,13 @@ $('classicCopy').addEventListener('click', async () => {
 });
 $('classicDecrypt').addEventListener('click', async () => {
   const value = $('classicInput').value.trim();
-  const secret = encryptionSecret;
+  const secret = accessPassword;
   if (!value || !secret) { status('Enter an encrypted message.'); return; }
   try {
     $('classicDecrypted').value = await decryptMessage(value, secret);
     status('Classic message decrypted.');
   } catch {
-    status('Could not decrypt. Check the message and password.');
+    status('Could not decrypt. Check the access password.');
   }
 });
 savedProfile = loadProfile();
