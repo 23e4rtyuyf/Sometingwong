@@ -46,6 +46,9 @@ class ServerApiTests(unittest.TestCase):
             server._sessions.clear()
             server._failed_logins.clear()
         self.saved_message = None
+        self.rooms = {}
+        self.legacy_room_codes = {"123456"}
+        self.members = set()
         self.supabase = patch.object(server, "_supabase_request", side_effect=self.fake_supabase)
         self.auth_user = patch.object(server, "_create_anonymous_user", return_value=TEST_SENDER_ID)
         self.supabase.start()
@@ -53,15 +56,48 @@ class ServerApiTests(unittest.TestCase):
         self.addCleanup(self.supabase.stop)
         self.addCleanup(self.auth_user.stop)
 
-    def fake_supabase(self, path, method="GET", body=None, query=None):
-        if method == "GET":
-            return [{
-                "id": 1,
-                "created_at": "2026-11-10T12:00:00Z",
-                "sender_email": "Test",
-                "encrypted_text": "PM3." + "A" * 45,
-            }]
-        self.saved_message = body
+    def fake_supabase(self, path, method="GET", body=None, query=None, prefer="return=minimal"):
+        query = query or {}
+        table = path.rsplit("/", 1)[-1]
+        room_code = query.get("room_code", "").removeprefix("eq.")
+        sender_id = query.get("sender_id", "").removeprefix("eq.")
+        if table == "chat_api_rooms":
+            if method == "GET":
+                room = self.rooms.get(room_code)
+                if room:
+                    return [dict(room)]
+                if room_code in self.legacy_room_codes:
+                    return [{"room_code": room_code, "room_name": f"Room {room_code}"}]
+                return []
+            if method == "POST":
+                room = dict(body)
+                self.rooms[room["room_code"]] = room
+                return [dict(room)] if prefer == "return=representation" else None
+            if method == "PATCH":
+                room = self.rooms.get(room_code)
+                if not room:
+                    return []
+                room.update(body)
+                return [dict(room)] if prefer == "return=representation" else None
+        if table == "chat_api_room_members":
+            if method == "GET":
+                return [{"room_code": room_code}] if (room_code, sender_id) in self.members else []
+            if method == "POST":
+                self.members.add((body["room_code"], body["sender_id"]))
+                return None
+        if table == "messages":
+            if method == "GET" and query.get("select") == "id":
+                return []
+            if method == "GET":
+                return [{
+                    "id": 1,
+                    "created_at": "2026-11-10T12:00:00Z",
+                    "sender_email": "Test",
+                    "encrypted_text": "PM3." + "A" * 45,
+                }]
+            if method == "POST":
+                self.saved_message = body
+                return None
         return None
 
     def request(self, path, method="GET", payload=None, token=None, origin=ORIGIN):
@@ -96,6 +132,14 @@ class ServerApiTests(unittest.TestCase):
         )
         self.assertEqual(status_code, 200)
         return session["token"]
+
+    def join_room(self, token, room_code="123456"):
+        return self.request(
+            "/api/rooms/join",
+            method="POST",
+            token=token,
+            payload={"roomCode": room_code},
+        )
 
     def test_chat_api_rejects_unauthenticated_and_unapproved_origins(self):
         status_code, payload = self.request("/api/messages?room=123456")
@@ -151,9 +195,13 @@ class ServerApiTests(unittest.TestCase):
 
     def test_authenticated_chat_read_and_write_use_server_identity(self):
         token = self.sign_in()
+        status_code, room = self.join_room(token)
+        self.assertEqual(status_code, 200)
+        self.assertEqual(room["roomName"], "Room 123456")
         status_code, response = self.request("/api/messages?room=123456", token=token)
         self.assertEqual(status_code, 200)
         self.assertEqual(response["messages"][0]["sender_email"], "Test")
+        self.assertEqual(response["roomName"], "Room 123456")
 
         status_code, _ = self.request(
             "/api/messages",
@@ -172,6 +220,7 @@ class ServerApiTests(unittest.TestCase):
 
     def test_server_rejects_unencrypted_or_invalid_room_messages(self):
         token = self.sign_in()
+        self.join_room(token)
         status_code, _ = self.request(
             "/api/messages",
             method="POST",
@@ -184,6 +233,76 @@ class ServerApiTests(unittest.TestCase):
         )
         self.assertEqual(status_code, 400)
         self.assertIsNone(self.saved_message)
+
+    def test_chat_rooms_can_be_named_and_renamed(self):
+        token = self.sign_in()
+        status_code, created = self.request(
+            "/api/rooms",
+            method="POST",
+            token=token,
+            payload={"roomName": "Study group"},
+        )
+        self.assertEqual(status_code, 201)
+        self.assertEqual(created["roomName"], "Study group")
+        self.assertRegex(created["roomCode"], r"^[0-9]{6}$")
+
+        status_code, renamed = self.request(
+            "/api/rooms/rename",
+            method="POST",
+            token=token,
+            payload={"roomCode": created["roomCode"], "roomName": "Science club"},
+        )
+        self.assertEqual(status_code, 200)
+        self.assertEqual(renamed["roomName"], "Science club")
+
+        status_code, joined = self.join_room(token, created["roomCode"])
+        self.assertEqual(status_code, 200)
+        self.assertEqual(joined["roomName"], "Science club")
+        status_code, chat = self.request(
+            f"/api/messages?room={created['roomCode']}",
+            token=token,
+        )
+        self.assertEqual(status_code, 200)
+        self.assertEqual(chat["roomName"], "Science club")
+
+    def test_room_membership_is_required_for_messages_and_renaming(self):
+        token = self.sign_in()
+        self.join_room(token, "123456")
+
+        status_code, payload = self.request(
+            "/api/messages?room=654321",
+            token=token,
+        )
+        self.assertEqual(status_code, 403)
+        self.assertIn("Join this chat", payload["error"])
+
+    def test_unknown_room_code_cannot_be_joined(self):
+        token = self.sign_in()
+        status_code, payload = self.join_room(token, "654321")
+        self.assertEqual(status_code, 404)
+        self.assertIn("Chat not found", payload["error"])
+
+        status_code, payload = self.request(
+            "/api/messages",
+            method="POST",
+            token=token,
+            payload={
+                "sender_email": "Test",
+                "receiver_email": "654321",
+                "encrypted_text": "PM3." + "B" * 45,
+            },
+        )
+        self.assertEqual(status_code, 403)
+        self.assertIn("Join this chat", payload["error"])
+
+        status_code, payload = self.request(
+            "/api/rooms/rename",
+            method="POST",
+            token=token,
+            payload={"roomCode": "654321", "roomName": "Other room"},
+        )
+        self.assertEqual(status_code, 403)
+        self.assertIn("Join this chat", payload["error"])
 
 
 if __name__ == "__main__":

@@ -87,7 +87,7 @@ def _session_key(token):
     return hmac.new(secret, token.encode("utf-8"), hashlib.sha256).digest()
 
 
-def _supabase_request(path, method="GET", body=None, query=None):
+def _supabase_request(path, method="GET", body=None, query=None, prefer="return=minimal"):
     service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     if not service_key:
         raise ApiError(503, "Chat storage is not configured on the server.")
@@ -100,7 +100,7 @@ def _supabase_request(path, method="GET", body=None, query=None):
         "Authorization": f"Bearer {service_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "Prefer": "return=minimal",
+        "Prefer": prefer,
     })
     try:
         with urlopen(request, timeout=12) as response:
@@ -244,6 +244,15 @@ class SiteHandler(BaseHTTPRequestHandler):
             if path == "/api/auth/logout":
                 self._logout()
                 return
+            if path == "/api/rooms":
+                self._create_room()
+                return
+            if path == "/api/rooms/join":
+                self._join_room()
+                return
+            if path == "/api/rooms/rename":
+                self._rename_room()
+                return
             if path == "/api/messages":
                 self._insert_message()
                 return
@@ -345,12 +354,99 @@ class SiteHandler(BaseHTTPRequestHandler):
                 _sessions.pop(_session_key(token), None)
         self._send_json(200, {"ok": True})
 
+    def _find_room(self, room):
+        rows = _supabase_request("/rest/v1/chat_api_rooms", query={
+            "select": "room_code,room_name",
+            "room_code": f"eq.{room}",
+            "limit": "1",
+        })
+        return rows[0] if isinstance(rows, list) and rows else None
+
+    def _add_room_member(self, room, sender_id):
+        _supabase_request(
+            "/rest/v1/chat_api_room_members",
+            method="POST",
+            body={"room_code": room, "sender_id": sender_id},
+            query={"on_conflict": "room_code,sender_id"},
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    def _require_room_membership(self, session, room):
+        rows = _supabase_request("/rest/v1/chat_api_room_members", query={
+            "select": "room_code",
+            "room_code": f"eq.{room}",
+            "sender_id": f"eq.{session['sender_id']}",
+            "limit": "1",
+        })
+        if not isinstance(rows, list) or not rows:
+            raise ApiError(403, "Join this chat before opening it.")
+
+    def _create_room(self):
+        session = self._require_session()
+        body = self._read_body()
+        room_name = body.get("roomName")
+        if not isinstance(room_name, str) or not NAME_RE.fullmatch(room_name.strip()):
+            raise ApiError(400, "Chat name must be 1 to 40 characters.")
+        room_name = room_name.strip()
+        for _ in range(20):
+            room = f"{secrets.randbelow(1_000_000):06d}"
+            existing = self._find_room(room)
+            messages = _supabase_request("/rest/v1/messages", query={
+                "select": "id",
+                "receiver_email": f"eq.{room}",
+                "limit": "1",
+            })
+            if existing or (isinstance(messages, list) and messages):
+                continue
+            _supabase_request(
+                "/rest/v1/chat_api_rooms",
+                method="POST",
+                body={"room_code": room, "room_name": room_name},
+            )
+            self._add_room_member(room, session["sender_id"])
+            self._send_json(201, {"roomCode": room, "roomName": room_name})
+            return
+        raise ApiError(503, "Could not create a unique chat code. Try again.")
+
+    def _join_room(self):
+        session = self._require_session()
+        body = self._read_body()
+        room = body.get("roomCode")
+        if not isinstance(room, str) or not ROOM_RE.fullmatch(room):
+            raise ApiError(400, "Enter a valid 6-digit room code.")
+        room_info = self._find_room(room)
+        if not room_info:
+            raise ApiError(404, "Chat not found. Check the room code.")
+        self._add_room_member(room, session["sender_id"])
+        self._send_json(200, {"roomCode": room, "roomName": room_info["room_name"]})
+
+    def _rename_room(self):
+        session = self._require_session()
+        body = self._read_body()
+        room = body.get("roomCode")
+        room_name = body.get("roomName")
+        if not isinstance(room, str) or not ROOM_RE.fullmatch(room):
+            raise ApiError(400, "Enter a valid 6-digit room code.")
+        if not isinstance(room_name, str) or not NAME_RE.fullmatch(room_name.strip()):
+            raise ApiError(400, "Chat name must be 1 to 40 characters.")
+        self._require_room_membership(session, room)
+        room_name = room_name.strip()
+        _supabase_request(
+            "/rest/v1/chat_api_rooms",
+            method="PATCH",
+            body={"room_name": room_name},
+            query={"room_code": f"eq.{room}"},
+        )
+        self._send_json(200, {"roomCode": room, "roomName": room_name})
+
     def _read_messages(self, query):
-        self._require_session()
+        session = self._require_session()
         room_values = query.get("room", [])
         room = room_values[0] if len(room_values) == 1 else ""
         if not ROOM_RE.fullmatch(room):
             raise ApiError(400, "Enter a valid 6-digit room code.")
+        self._require_room_membership(session, room)
+        room_info = self._find_room(room)
         rows = _supabase_request("/rest/v1/messages", query={
             "select": "id,created_at,sender_email,encrypted_text",
             "receiver_email": f"eq.{room}",
@@ -359,7 +455,10 @@ class SiteHandler(BaseHTTPRequestHandler):
         })
         if not isinstance(rows, list):
             raise ApiError(502, "Chat storage returned an invalid response.")
-        self._send_json(200, {"messages": list(reversed(rows))})
+        self._send_json(200, {
+            "messages": list(reversed(rows)),
+            "roomName": room_info["room_name"] if room_info else f"Room {room}",
+        })
 
     def _insert_message(self):
         session = self._require_session()
@@ -369,6 +468,7 @@ class SiteHandler(BaseHTTPRequestHandler):
         ciphertext = body.get("encrypted_text")
         if not isinstance(room, str) or not ROOM_RE.fullmatch(room):
             raise ApiError(400, "Enter a valid 6-digit room code.")
+        self._require_room_membership(session, room)
         if not isinstance(sender, str) or not NAME_RE.fullmatch(sender.strip()):
             raise ApiError(400, "Enter a name between 1 and 40 characters.")
         if not isinstance(ciphertext, str) or not CIPHERTEXT_RE.fullmatch(ciphertext):

@@ -395,6 +395,102 @@ async function requireSession(request) {
   return session;
 }
 
+function validatedRoomName(value) {
+  const roomName = typeof value === "string" ? value.trim() : "";
+  if (!/^[^\x00-\x1f\x7f]{1,40}$/.test(roomName)) {
+    throw new ApiError(400, "Chat name must be 1 to 40 characters.");
+  }
+  return roomName;
+}
+
+async function findRoom(roomCode) {
+  const rows = await supabaseRequest("chat_api_rooms", {
+    select: "room_code,room_name",
+    room_code: `eq.${roomCode}`,
+    limit: "1",
+  });
+  return Array.isArray(rows) ? rows[0] || null : null;
+}
+
+async function addRoomMember(roomCode, senderId) {
+  await supabaseRequest("chat_api_room_members", {
+    on_conflict: "room_code,sender_id",
+  }, {
+    method: "POST",
+    body: { room_code: roomCode, sender_id: senderId },
+    prefer: "resolution=merge-duplicates,return=minimal",
+  });
+}
+
+async function requireRoomMembership(roomCode, senderId) {
+  const rows = await supabaseRequest("chat_api_room_members", {
+    select: "room_code",
+    room_code: `eq.${roomCode}`,
+    sender_id: `eq.${senderId}`,
+    limit: "1",
+  });
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new ApiError(403, "Join this chat before opening it.");
+  }
+}
+
+async function createRoom(request) {
+  const session = await requireSession(request);
+  const body = await readJson(request);
+  const roomName = validatedRoomName(body.roomName);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const value = new DataView(randomBytes(4).buffer).getUint32(0);
+    const roomCode = String(value % 1_000_000).padStart(6, "0");
+    const existingRoom = await findRoom(roomCode);
+    const existingMessages = await supabaseRequest("messages", {
+      select: "id",
+      receiver_email: `eq.${roomCode}`,
+      limit: "1",
+    });
+    if (existingRoom || (Array.isArray(existingMessages) && existingMessages.length)) continue;
+    await supabaseRequest("chat_api_rooms", {}, {
+      method: "POST",
+      body: { room_code: roomCode, room_name: roomName },
+      prefer: "return=minimal",
+    });
+    await addRoomMember(roomCode, session.sender_id);
+    return { roomCode, roomName };
+  }
+  throw new ApiError(503, "Could not create a unique chat code. Try again.");
+}
+
+async function joinRoom(request) {
+  const session = await requireSession(request);
+  const body = await readJson(request);
+  const roomCode = body.roomCode;
+  if (typeof roomCode !== "string" || !/^[0-9]{6}$/.test(roomCode)) {
+    throw new ApiError(400, "Enter a valid 6-digit room code.");
+  }
+  const room = await findRoom(roomCode);
+  if (!room) throw new ApiError(404, "Chat not found. Check the room code.");
+  await addRoomMember(roomCode, session.sender_id);
+  return { roomCode, roomName: room.room_name };
+}
+
+async function renameRoom(request) {
+  const session = await requireSession(request);
+  const body = await readJson(request);
+  const roomCode = body.roomCode;
+  if (typeof roomCode !== "string" || !/^[0-9]{6}$/.test(roomCode)) {
+    throw new ApiError(400, "Enter a valid 6-digit room code.");
+  }
+  const roomName = validatedRoomName(body.roomName);
+  await requireRoomMembership(roomCode, session.sender_id);
+  await supabaseRequest("chat_api_rooms", {
+    room_code: `eq.${roomCode}`,
+  }, {
+    method: "PATCH",
+    body: { room_name: roomName },
+    prefer: "return=minimal",
+  });
+  return { roomCode, roomName };
+}
+
 async function logout(request) {
   const settings = config();
   const authorization = request.headers.get("authorization") || "";
@@ -409,13 +505,15 @@ async function logout(request) {
 }
 
 async function readMessages(request) {
-  await requireSession(request);
+  const session = await requireSession(request);
   const url = new URL(request.url);
   const rooms = url.searchParams.getAll("room");
   const room = rooms.length === 1 ? rooms[0] : "";
   if (!/^[0-9]{6}$/.test(room)) {
     throw new ApiError(400, "Enter a valid 6-digit room code.");
   }
+  await requireRoomMembership(room, session.sender_id);
+  const roomInfo = await findRoom(room);
   const messages = await supabaseRequest("messages", {
     select: "id,created_at,sender_email,encrypted_text",
     receiver_email: `eq.${room}`,
@@ -425,7 +523,10 @@ async function readMessages(request) {
   if (!Array.isArray(messages)) {
     throw new ApiError(502, "Chat storage returned an invalid response.");
   }
-  return { messages: messages.reverse() };
+  return {
+    messages: messages.reverse(),
+    roomName: roomInfo?.room_name || `Room ${room}`,
+  };
 }
 
 async function insertMessage(request) {
@@ -437,6 +538,7 @@ async function insertMessage(request) {
   if (typeof room !== "string" || !/^[0-9]{6}$/.test(room)) {
     throw new ApiError(400, "Enter a valid 6-digit room code.");
   }
+  await requireRoomMembership(room, session.sender_id);
   if (!/^[^\x00-\x1f\x7f]{1,40}$/.test(sender)) {
     throw new ApiError(400, "Enter a name between 1 and 40 characters.");
   }
@@ -482,6 +584,15 @@ async function handle(request) {
     }
     if (request.method === "POST" && route === "/api/auth/logout") {
       return jsonResponse(request, 200, await logout(request));
+    }
+    if (request.method === "POST" && route === "/api/rooms") {
+      return jsonResponse(request, 201, await createRoom(request));
+    }
+    if (request.method === "POST" && route === "/api/rooms/join") {
+      return jsonResponse(request, 200, await joinRoom(request));
+    }
+    if (request.method === "POST" && route === "/api/rooms/rename") {
+      return jsonResponse(request, 200, await renameRoom(request));
     }
     if (request.method === "GET" && route === "/api/messages") {
       return jsonResponse(request, 200, await readMessages(request));
