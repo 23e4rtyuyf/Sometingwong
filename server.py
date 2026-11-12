@@ -490,6 +490,10 @@ class SiteHandler(BaseHTTPRequestHandler):
 
     def _list_security_events(self):
         self._require_admin_session()
+        try:
+            _cleanup_security_data()
+        except Exception:
+            print("[chat-api] Expired security activity could not be cleaned up.", flush=True)
         rows = _supabase_request("/rest/v1/chat_api_security_events", query={
             "select": "event_id,created_at,event_type,request_method,request_path,status_code,address_hash",
             "order": "created_at.desc",
