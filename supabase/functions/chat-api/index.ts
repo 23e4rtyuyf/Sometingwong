@@ -5,6 +5,9 @@ const MAX_BODY_BYTES = 32_000;
 const MAX_MESSAGES = 500;
 const ROOM_JOIN_FAILURE_WINDOW_SECONDS = 15 * 60;
 const MAX_ROOM_JOIN_FAILURES = 8;
+const MAX_SIGN_IN_FAILURE_REPORTS = 5;
+const SECURITY_EVENT_RETENTION_DAYS = 30;
+const SECURITY_EVENT_LIST_LIMIT = 100;
 const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const encoder = new TextEncoder();
 
@@ -205,6 +208,9 @@ async function supabaseRequest(table, params = {}, options = {}) {
 async function cleanupExpiredRows() {
   const now = new Date().toISOString();
   const failedCutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const securityCutoff = new Date(
+    Date.now() - SECURITY_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000,
+  ).toISOString();
   await Promise.all([
     supabaseRequest("chat_api_challenges", { expires_at: `lt.${now}` }, {
       method: "DELETE",
@@ -218,7 +224,137 @@ async function cleanupExpiredRows() {
       method: "DELETE",
       prefer: "return=minimal",
     }),
+    supabaseRequest("chat_api_security_events", { created_at: `lt.${securityCutoff}` }, {
+      method: "DELETE",
+      prefer: "return=minimal",
+    }).catch(() => {
+      console.error("[chat-api] Expired security events could not be cleaned up.");
+    }),
   ]);
+}
+
+function securityEventType(route, status) {
+  if (route === "/api/rooms/join" && status === 404) return "invalid_room_code";
+  if (status === 401) return "unauthorized_request";
+  if (status === 403) return "forbidden_request";
+  if (status === 429) return "rate_limited_request";
+  if (status === 400 && route === "/api/admin/accounts") return "invalid_admin_request";
+  if (status === 404) return "unknown_route";
+  if (status >= 500) return "server_error";
+  return "";
+}
+
+function safeSecurityPath(route) {
+  const path = typeof route === "string"
+    ? route.replace(/[^A-Za-z0-9/_-]/g, "").slice(0, 120)
+    : "";
+  return path.startsWith("/api/") ? path : "/api/unknown";
+}
+
+async function writeSecurityEvent(request, route, eventType, status) {
+  const settings = config();
+  const address = clientAddress(request);
+  const addressHash = address !== "unknown" && settings.sessionSecret
+    ? await hashForStorage(settings.sessionSecret, `security-event-ip:${address}`)
+    : null;
+  await supabaseRequest("chat_api_security_events", {}, {
+    method: "POST",
+    body: {
+      event_id: encodeBase64Url(randomBytes(18)),
+      event_type: eventType,
+      request_method: request.method === "GET" ? "GET" : "POST",
+      request_path: safeSecurityPath(route),
+      status_code: status,
+      address_hash: addressHash,
+    },
+    prefer: "return=minimal",
+  });
+}
+
+async function allowSecurityEvent(request, eventType) {
+  const settings = config();
+  const address = clientAddress(request);
+  if (!settings.sessionSecret || address === "unknown") return false;
+  const addressHash = await hashForStorage(
+    settings.sessionSecret,
+    `security-log:${eventType}:${address}`,
+  );
+  const cutoff = new Date(Date.now() - 60 * 1000).toISOString();
+  const recent = await supabaseRequest("chat_api_failed_logins", {
+    select: "attempt_id",
+    address_hash: `eq.${addressHash}`,
+    attempted_at: `gt.${cutoff}`,
+    limit: "1",
+  });
+  if (!Array.isArray(recent)) {
+    throw new ApiError(502, "Security activity rate limit returned an invalid response.");
+  }
+  if (recent.length > 0) return false;
+  await supabaseRequest("chat_api_failed_logins", {}, {
+    method: "POST",
+    body: {
+      attempt_id: encodeBase64Url(randomBytes(18)),
+      address_hash: addressHash,
+    },
+    prefer: "return=minimal",
+  });
+  return true;
+}
+
+async function recordSecurityEvent(request, route, eventType, status) {
+  try {
+    if (await allowSecurityEvent(request, eventType)) {
+      await writeSecurityEvent(request, route, eventType, status);
+    }
+  } catch {
+    console.error("[chat-api] Security event could not be recorded.");
+  }
+}
+
+async function reportSignInFailure(request) {
+  const body = await readJson(request);
+  if (Object.keys(body).length !== 0) {
+    throw new ApiError(400, "Unexpected sign-in report data.");
+  }
+  const settings = config();
+  const address = clientAddress(request);
+  if (!settings.serviceKey || !settings.sessionSecret || address === "unknown") {
+    return { ok: true, recorded: false };
+  }
+  const addressHash = await hashForStorage(
+    settings.sessionSecret,
+    `reported-sign-in-ip:${address}`,
+  );
+  const cutoff = new Date(
+    Date.now() - ROOM_JOIN_FAILURE_WINDOW_SECONDS * 1000,
+  ).toISOString();
+  const recentReports = await supabaseRequest("chat_api_failed_logins", {
+    select: "attempt_id",
+    address_hash: `eq.${addressHash}`,
+    attempted_at: `gt.${cutoff}`,
+    limit: String(MAX_SIGN_IN_FAILURE_REPORTS),
+  });
+  if (!Array.isArray(recentReports)) {
+    throw new ApiError(502, "Security activity storage returned an invalid response.");
+  }
+  if (recentReports.length >= MAX_SIGN_IN_FAILURE_REPORTS) {
+    return { ok: true, recorded: false };
+  }
+  await supabaseRequest("chat_api_failed_logins", {}, {
+    method: "POST",
+    body: {
+      attempt_id: encodeBase64Url(randomBytes(18)),
+      address_hash: addressHash,
+    },
+    prefer: "return=minimal",
+  });
+  await recordSecurityEvent(
+    request,
+    "/api/auth/sign-in",
+    "client_reported_sign_in_failure",
+    401,
+  );
+  return { ok: true, recorded: true };
 }
 
 async function roomJoinFailureHashes(request, senderId) {
@@ -339,6 +475,72 @@ async function requireSession(request) {
     throw new ApiError(401, "Your session expired. Sign in again.");
   }
   return session;
+}
+
+async function supabaseAdminUserById(userId) {
+  const settings = config();
+  if (!settings.serviceKey) {
+    throw new ApiError(503, "Administrator verification is not configured.");
+  }
+  let response;
+  try {
+    response = await fetch(
+      `${settings.supabaseUrl}/auth/v1/admin/users/${encodeURIComponent(userId)}`,
+      {
+        headers: {
+          apikey: settings.serviceKey,
+          Authorization: `Bearer ${settings.serviceKey}`,
+          Accept: "application/json",
+        },
+        cache: "no-store",
+      },
+    );
+  } catch {
+    throw new ApiError(503, "Administrator verification is temporarily unavailable.");
+  }
+  if (response.status === 404) {
+    throw new ApiError(403, "Only an approved account administrator can view security activity.");
+  }
+  if (!response.ok) {
+    throw new ApiError(503, "Administrator verification could not be completed.");
+  }
+  const payload = await response.json().catch(() => ({}));
+  return payload?.user && typeof payload.user === "object" ? payload.user : payload;
+}
+
+async function requireChatAdmin(request) {
+  const session = await requireSession(request);
+  const user = await supabaseAdminUserById(session.sender_id);
+  if (user?.id !== session.sender_id || !isChatAdmin(user)) {
+    throw new ApiError(403, "Only an approved account administrator can view security activity.");
+  }
+  return session;
+}
+
+async function listSecurityEvents(request) {
+  await requireChatAdmin(request);
+  await cleanupExpiredRows();
+  const rows = await supabaseRequest("chat_api_security_events", {
+    select: "event_id,created_at,event_type,request_method,request_path,status_code,address_hash",
+    order: "created_at.desc",
+    limit: String(SECURITY_EVENT_LIST_LIMIT),
+  });
+  if (!Array.isArray(rows)) {
+    throw new ApiError(502, "Security activity storage returned an invalid response.");
+  }
+  return {
+    events: rows.map((event) => ({
+      id: event.event_id,
+      occurredAt: event.created_at,
+      type: event.event_type,
+      method: event.request_method,
+      path: event.request_path,
+      status: event.status_code,
+      sourceHash: typeof event.address_hash === "string"
+        ? event.address_hash.slice(0, 12)
+        : "",
+    })),
+  };
 }
 
 function validatedRoomName(value) {
@@ -648,6 +850,7 @@ async function handle(request) {
   const route = routeFromUrl(request.url);
   if (request.method === "OPTIONS") {
     if (request.headers.get("origin") !== ALLOWED_ORIGIN) {
+      await recordSecurityEvent(request, route, "forbidden_request", 403);
       return jsonResponse(request, 403, { error: "This site is not allowed to use the chat API." });
     }
     return emptyResponse(request);
@@ -665,8 +868,14 @@ async function handle(request) {
     if (request.method === "POST" && route === "/api/auth/session") {
       return jsonResponse(request, 200, await createApiSession(request));
     }
+    if (request.method === "POST" && route === "/api/security/report-login-failure") {
+      return jsonResponse(request, 202, await reportSignInFailure(request));
+    }
     if (request.method === "POST" && route === "/api/auth/logout") {
       return jsonResponse(request, 200, await logout(request));
+    }
+    if (request.method === "GET" && route === "/api/admin/security-events") {
+      return jsonResponse(request, 200, await listSecurityEvents(request));
     }
     if (request.method === "POST" && route === "/api/rooms") {
       return jsonResponse(request, 201, await createRoom(request));
@@ -695,6 +904,11 @@ async function handle(request) {
     }
     throw new ApiError(404, "Not found.");
   } catch (error) {
+    const status = error instanceof ApiError ? error.status : 500;
+    const eventType = securityEventType(route, status);
+    if (eventType) {
+      await recordSecurityEvent(request, route, eventType, status);
+    }
     if (error instanceof ApiError) {
       return jsonResponse(request, error.status, { error: error.message });
     }

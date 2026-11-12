@@ -97,8 +97,14 @@
     .terms-content { max-height:52vh; overflow-y:auto; margin:.75rem 0; font-size:.9rem; line-height:1.5; }
     .terms-content h2 { margin:1rem 0 .35rem; font-size:1rem; }
     .terms-content p { margin:.4rem 0; }
+    .terms-dialog button:disabled { cursor:not-allowed; }
     .terms-ack { display:flex; align-items:flex-start; gap:.6rem; font-weight:400; line-height:1.4; }
     .terms-ack input { width:auto; flex:0 0 auto; margin-top:.2rem; }
+    .security-dialog { width:min(740px,calc(100% - 2rem)); max-height:calc(100% - 2rem); }
+    .security-events { display:grid; gap:.55rem; max-height:48vh; overflow-y:auto; margin:.75rem 0; }
+    .security-event { padding:.75rem; border:1px solid var(--line); border-radius:10px; background:#f8fafd; }
+    .security-event-header { display:flex; justify-content:space-between; gap:.75rem; }
+    .security-event p { margin:.3rem 0 0; }
     dialog { width:min(420px,calc(100% - 2rem)); border:1px solid var(--line); border-radius:15px; padding:1.25rem; color:var(--ink); background:#fff; box-shadow:0 20px 60px #0f172a40; }
     .terms-dialog { width:min(720px,calc(100% - 2rem)); max-height:calc(100% - 2rem); }
     dialog::backdrop { background:#0f172a99; }
@@ -151,7 +157,7 @@
   </section>
   <dialog id="termsDialog" class="terms-dialog" aria-labelledby="termsDialogTitle">
     <h2 id="termsDialogTitle">Terms of Service</h2>
-    <div class="terms-content">
+    <div id="termsContent" class="terms-content" role="region" aria-label="Terms of Service text. Scroll to the end to enable acceptance." tabindex="0">
         <p><strong>School employees:</strong> If you are an employee of a school, school district, or educational institution, you may not access or use this Platform. These Terms do not prohibit students from using the Platform solely because they are students.</p>
         <h2>1. Acceptance of terms</h2>
         <p>By accessing or using the Private Messages application (the “Platform”), you agree to these Terms of Service. If you do not agree, do not use the Platform.</p>
@@ -180,13 +186,13 @@
         <p>If an individual accesses the Platform in violation of these Terms while acting within the scope of employment, on a device or network owned by an educational institution, or at the direction or encouragement of a school administrator, the employing institution shall be jointly and severally liable for all resulting liquidated damages, fees, and remedies.</p>
     </div>
     <label class="terms-ack" for="acceptTerms">
-      <input id="acceptTerms" type="checkbox">
+      <input id="acceptTerms" type="checkbox" disabled>
       <span>I agree to the Terms of Service and certify under penalty of breach of contract that I am not an employee, administrator, contractor, or agent of any public or private school or educational institution.</span>
     </label>
     <p id="termsStatus" class="status" role="status" aria-live="polite"></p>
     <div class="dialog-actions">
       <button id="closeTerms" class="secondary" type="button">Close</button>
-      <button id="agreeTerms" type="button">I Agree</button>
+      <button id="agreeTerms" type="button" disabled>I Agree</button>
     </div>
   </dialog>
   <dialog id="roomNameDialog" aria-labelledby="roomNameDialogTitle">
@@ -219,6 +225,17 @@
       </div>
     </form>
   </dialog>
+  <dialog id="securityDialog" class="security-dialog" aria-labelledby="securityDialogTitle">
+    <h2 id="securityDialogTitle">Security activity</h2>
+    <p class="small">Recent failed or blocked requests to the chat API. Source groups use one-way hashes; raw IP addresses, messages, passwords, and tokens are not shown.</p>
+    <p class="small">Failed account-password sign-ins are reported by the browser and are not independently verified here. Full Edge Function runtime logs are in Supabase Dashboard → Edge Functions → your function → Logs.</p>
+    <p id="securityStatus" class="status" role="status" aria-live="polite"></p>
+    <div id="securityEvents" class="security-events" aria-live="polite"></div>
+    <div class="dialog-actions">
+      <button id="refreshSecurityEvents" class="secondary" type="button">Refresh</button>
+      <button id="closeSecurityDialog" type="button">Close</button>
+    </div>
+  </dialog>
   <section id="protectedApp" class="hidden">
   <div class="app-shell">
   <header class="app-top">
@@ -230,6 +247,7 @@
     <button id="chatTab" class="active" type="button">Chats</button>
     <button id="classicTab" type="button">Encrypt / decrypt</button>
     <button id="manageAccounts" class="secondary" type="button" hidden>Add account</button>
+    <button id="securityDashboard" class="secondary" type="button" hidden>Security log</button>
   </nav>
   </header>
   <p class="small">Chat history is saved on this device after it syncs. The app does not store your account password or access password.</p>
@@ -357,6 +375,7 @@ let profileSaveTimer = null;
 let profileSavePromise = Promise.resolve();
 let activeRoomName = '';
 let termsAccepted = false;
+let termsAtBottom = false;
 let savedProfile = {};
 let localHistorySaved = false;
 const historySyncs = new Map();
@@ -374,6 +393,10 @@ function lockForExpiredSession() {
   accountDisplayName = '';
   isAccountAdmin = false;
   $('manageAccounts').hidden = true;
+  $('securityDashboard').hidden = true;
+  if ($('securityDialog').open) $('securityDialog').close();
+  $('securityEvents').replaceChildren();
+  $('securityStatus').textContent = '';
   accessPassword = '';
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
@@ -422,6 +445,14 @@ async function signInWithAccount(email, password) {
   }
   const result = await response.json().catch(() => ({}));
   if (!response.ok || typeof result.access_token !== 'string') {
+    try {
+      await apiRequest('/api/security/report-login-failure', {
+        method: 'POST',
+        body: '{}',
+      }, false);
+    } catch {
+      // A failed log report must not change the sign-in error shown to the user.
+    }
     throw new Error('Account sign-in failed. Check your email and password.');
   }
   return result;
@@ -669,11 +700,25 @@ function saveProfile() {
   $('profileName').value = nickname;
 }
 $('showTerms').addEventListener('click', () => {
-  $('termsStatus').textContent = '';
+  termsAtBottom = false;
+  $('acceptTerms').checked = false;
+  $('acceptTerms').disabled = true;
+  $('agreeTerms').disabled = true;
+  $('termsStatus').textContent = 'Scroll to the bottom of the Terms to enable acceptance.';
   $('termsDialog').showModal();
+  $('termsContent').scrollTop = 0;
+  requestAnimationFrame(updateTermsAcceptance);
 });
+$('termsContent').addEventListener('scroll', updateTermsAcceptance, { passive: true });
+$('acceptTerms').addEventListener('change', updateTermsAcceptance);
+window.addEventListener('resize', updateTermsAcceptance);
 $('closeTerms').addEventListener('click', () => $('termsDialog').close());
 $('agreeTerms').addEventListener('click', () => {
+  if (!termsAtBottom) {
+    $('termsStatus').textContent = 'Scroll to the bottom of the Terms before accepting.';
+    $('termsContent').focus();
+    return;
+  }
   if (!$('acceptTerms').checked) {
     $('termsStatus').textContent = 'Check the box to accept the Terms of Service.';
     $('acceptTerms').focus();
@@ -683,6 +728,15 @@ $('agreeTerms').addEventListener('click', () => {
   $('termsDialog').close();
   $('termsAcceptanceStatus').textContent = 'Terms accepted for this session.';
 });
+function updateTermsAcceptance() {
+  const content = $('termsContent');
+  termsAtBottom = content.scrollTop + content.clientHeight >= content.scrollHeight - 4;
+  $('acceptTerms').disabled = !termsAtBottom;
+  $('agreeTerms').disabled = !termsAtBottom || !$('acceptTerms').checked;
+  $('termsStatus').textContent = termsAtBottom
+    ? 'You reached the end. Check the box to enable I Agree.'
+    : 'Scroll to the bottom of the Terms to enable acceptance.';
+}
 $('accessForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!termsAccepted) {
@@ -706,6 +760,7 @@ $('accessForm').addEventListener('submit', async (event) => {
     supabaseAccessToken = account.access_token;
     isAccountAdmin = false;
     $('manageAccounts').hidden = true;
+    $('securityDashboard').hidden = true;
     const accountName = typeof account.user?.user_metadata?.display_name === 'string'
       ? account.user.user_metadata.display_name.trim().slice(0, 40)
       : '';
@@ -738,6 +793,7 @@ $('accessForm').addEventListener('submit', async (event) => {
     apiToken = session.token;
     isAccountAdmin = session.isAdmin === true;
     $('manageAccounts').hidden = !isAccountAdmin;
+    $('securityDashboard').hidden = !isAccountAdmin;
     accessPassword = candidate;
     $('accountPassword').value = '';
     $('accessPassword').value = '';
@@ -1363,6 +1419,80 @@ $('accountForm').addEventListener('submit', async (event) => {
     button.disabled = false;
   }
 });
+function securityEventLabel(type) {
+  const labels = {
+    client_reported_sign_in_failure: 'Sign-in failure reported by browser',
+    unauthorized_request: 'Request without valid sign-in',
+    forbidden_request: 'Blocked access attempt',
+    rate_limited_request: 'Request rate limit reached',
+    invalid_room_code: 'Invalid chat-code attempt',
+    invalid_admin_request: 'Invalid account-admin request',
+    unknown_route: 'Unknown API route requested',
+    server_error: 'Server request failed',
+  };
+  return labels[type] || 'Security event';
+}
+function renderSecurityEvents(events) {
+  const list = $('securityEvents');
+  list.replaceChildren();
+  if (!Array.isArray(events) || events.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'small';
+    empty.textContent = 'No recent security events were recorded.';
+    list.append(empty);
+    return;
+  }
+  for (const event of events) {
+    const card = document.createElement('article');
+    card.className = 'security-event';
+    const header = document.createElement('div');
+    header.className = 'security-event-header';
+    const title = document.createElement('strong');
+    title.textContent = securityEventLabel(event.type);
+    const code = document.createElement('span');
+    code.className = 'small';
+    code.textContent = `HTTP ${Number(event.status) || '—'}`;
+    header.append(title, code);
+
+    const details = document.createElement('p');
+    details.className = 'small';
+    const date = event.occurredAt ? new Date(event.occurredAt) : null;
+    const dateText = date && Number.isFinite(date.getTime())
+      ? date.toLocaleString()
+      : 'Time unavailable';
+    details.textContent = `${event.method || 'Request'} ${event.path || ''} · ${dateText}`;
+    card.append(header, details);
+    if (event.sourceHash) {
+      const source = document.createElement('p');
+      source.className = 'small';
+      source.textContent = `Anonymous source group: ${event.sourceHash}`;
+      card.append(source);
+    }
+    list.append(card);
+  }
+}
+async function loadSecurityEvents() {
+  if (!isAccountAdmin) return;
+  const button = $('refreshSecurityEvents');
+  button.disabled = true;
+  $('securityStatus').textContent = 'Loading recent security activity…';
+  try {
+    const result = await apiRequest('/api/admin/security-events');
+    renderSecurityEvents(result.events);
+    $('securityStatus').textContent = `Showing up to ${Array.isArray(result.events) ? result.events.length : 0} recent events.`;
+  } catch (error) {
+    $('securityStatus').textContent = error.message || 'Could not load security activity.';
+  } finally {
+    button.disabled = false;
+  }
+}
+$('securityDashboard').addEventListener('click', () => {
+  if (!isAccountAdmin) return;
+  $('securityDialog').showModal();
+  void loadSecurityEvents();
+});
+$('refreshSecurityEvents').addEventListener('click', () => void loadSecurityEvents());
+$('closeSecurityDialog').addEventListener('click', () => $('securityDialog').close());
 $('loadOlder').addEventListener('click', loadOlderMessages);
 $('deleteMyMessages').addEventListener('click', () => {
   $('deleteMyMessages').closest('details').open = false;

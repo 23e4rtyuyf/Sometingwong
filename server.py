@@ -8,7 +8,7 @@ import re
 import secrets
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -24,6 +24,9 @@ MAX_BODY_BYTES = 32_000
 MAX_MESSAGES = 500
 ROOM_JOIN_FAILURE_WINDOW = 15 * 60
 MAX_ROOM_JOIN_FAILURES = 8
+MAX_SIGN_IN_FAILURE_REPORTS = 5
+SECURITY_EVENT_RETENTION_DAYS = 30
+SECURITY_EVENT_LIST_LIMIT = 100
 CURSOR_TIMESTAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$")
 ROOM_RE = re.compile(r"^[0-9]{6}$")
 NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,40}$")
@@ -156,6 +159,97 @@ def _is_chat_admin(user):
     return email.strip().lower() in allowed
 
 
+def _security_event_type(path, status):
+    if path == "/api/rooms/join" and status == 404:
+        return "invalid_room_code"
+    if status == 401:
+        return "unauthorized_request"
+    if status == 403:
+        return "forbidden_request"
+    if status == 429:
+        return "rate_limited_request"
+    if status == 400 and path == "/api/admin/accounts":
+        return "invalid_admin_request"
+    if status == 404:
+        return "unknown_route"
+    if status >= 500:
+        return "server_error"
+    return ""
+
+
+def _security_address_hash(namespace, address):
+    secret = os.environ.get("SESSION_SECRET", "").encode("utf-8")
+    if not secret or not address:
+        return None
+    message = f"{namespace}:{address}".encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+
+def _allow_security_event(handler, event_type):
+    address = handler.client_address[0] if handler.client_address else ""
+    if not address or not os.environ.get("SESSION_SECRET"):
+        return False
+    address_hash = _security_address_hash(f"security-log:{event_type}", address)
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    recent = _supabase_request("/rest/v1/chat_api_failed_logins", query={
+        "select": "attempt_id",
+        "address_hash": f"eq.{address_hash}",
+        "attempted_at": f"gt.{cutoff}",
+        "limit": "1",
+    })
+    if not isinstance(recent, list):
+        raise ApiError(502, "Security activity rate limit returned an invalid response.")
+    if recent:
+        return False
+    _supabase_request(
+        "/rest/v1/chat_api_failed_logins",
+        method="POST",
+        body={
+            "attempt_id": secrets.token_urlsafe(18),
+            "address_hash": address_hash,
+        },
+    )
+    return True
+
+
+def _write_security_event(handler, event_type, path, status):
+    clean_path = re.sub(r"[^A-Za-z0-9/_-]", "", str(path))[:120]
+    if not clean_path.startswith("/api/"):
+        clean_path = "/api/unknown"
+    address = handler.client_address[0] if handler.client_address else ""
+    address_hash = _security_address_hash("security-event-ip", address)
+    _supabase_request(
+        "/rest/v1/chat_api_security_events",
+        method="POST",
+        body={
+            "event_id": secrets.token_urlsafe(18),
+            "event_type": event_type,
+            "request_method": "GET" if handler.command == "GET" else "POST",
+            "request_path": clean_path,
+            "status_code": status,
+            "address_hash": address_hash,
+        },
+    )
+
+
+def _cleanup_security_data():
+    now = datetime.now(timezone.utc)
+    failed_cutoff = (now - timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+    event_cutoff = (
+        now - timedelta(days=SECURITY_EVENT_RETENTION_DAYS)
+    ).isoformat().replace("+00:00", "Z")
+    _supabase_request(
+        "/rest/v1/chat_api_failed_logins",
+        method="DELETE",
+        query={"attempted_at": f"lt.{failed_cutoff}"},
+    )
+    _supabase_request(
+        "/rest/v1/chat_api_security_events",
+        method="DELETE",
+        query={"created_at": f"lt.{event_cutoff}"},
+    )
+
+
 class SiteHandler(BaseHTTPRequestHandler):
     server_version = "PrivateChat/2"
 
@@ -215,8 +309,25 @@ class SiteHandler(BaseHTTPRequestHandler):
                 raise ApiError(401, "Your session expired. Sign in again.")
             return session
 
+    def _require_admin_session(self):
+        session = self._require_session()
+        if session.get("is_admin") is not True:
+            raise ApiError(403, "Only an approved account administrator can view security activity.")
+        return session
+
+    def _record_security_failure(self, path, status):
+        event_type = _security_event_type(path, status)
+        if not event_type:
+            return
+        try:
+            if _allow_security_event(self, event_type):
+                _write_security_event(self, event_type, path, status)
+        except Exception:
+            print("[chat-api] Security event could not be recorded.", flush=True)
+
     def do_OPTIONS(self):
         if not self._origin_allowed():
+            self._record_security_failure(urlsplit(self.path).path, 403)
             self._send_json(403, {"error": "This site is not allowed to use the chat API."})
             return
         self.send_response(204)
@@ -241,11 +352,15 @@ class SiteHandler(BaseHTTPRequestHandler):
             if path.path == "/api/rooms":
                 self._list_rooms()
                 return
+            if path.path == "/api/admin/security-events":
+                self._list_security_events()
+                return
             if path.path == "/api/messages":
                 self._read_messages(parse_qs(path.query))
                 return
             raise ApiError(404, "Not found.")
         except ApiError as error:
+            self._record_security_failure(path.path, error.status)
             self._send_json(error.status, {"error": str(error)})
 
     def do_POST(self):
@@ -254,6 +369,9 @@ class SiteHandler(BaseHTTPRequestHandler):
             self._require_origin()
             if path == "/api/auth/session":
                 self._create_api_session()
+                return
+            if path == "/api/security/report-login-failure":
+                self._report_sign_in_failure()
                 return
             if path == "/api/auth/logout":
                 self._logout()
@@ -278,6 +396,7 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return
             raise ApiError(404, "Not found.")
         except ApiError as error:
+            self._record_security_failure(path, error.status)
             self._send_json(error.status, {"error": str(error)})
 
     def _serve_file(self, path, head_only=False):
@@ -313,12 +432,86 @@ class SiteHandler(BaseHTTPRequestHandler):
         user = _supabase_auth_user_details(access_token)
         sender_id = user["id"]
         is_admin = _is_chat_admin(user)
+        try:
+            _cleanup_security_data()
+        except Exception:
+            print("[chat-api] Expired security activity could not be cleaned up.", flush=True)
         token = secrets.token_urlsafe(32)
         session_key = _session_key(token)
         expires = time.time() + SESSION_TTL
         with _lock:
-            _sessions[session_key] = {"sender_id": sender_id, "expires": expires}
+            _sessions[session_key] = {
+                "sender_id": sender_id,
+                "expires": expires,
+                "is_admin": is_admin,
+            }
         self._send_json(200, {"token": token, "expiresAt": int(expires), "isAdmin": is_admin})
+
+    def _report_sign_in_failure(self):
+        body = self._read_body()
+        if body:
+            raise ApiError(400, "Unexpected sign-in report data.")
+        secret = os.environ.get("SESSION_SECRET", "")
+        address = self.client_address[0] if self.client_address else ""
+        if not secret or not address or not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
+            self._send_json(202, {"ok": True, "recorded": False})
+            return
+        address_hash = _security_address_hash("reported-sign-in-ip", address)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=15)
+        ).isoformat().replace("+00:00", "Z")
+        recent = _supabase_request("/rest/v1/chat_api_failed_logins", query={
+            "select": "attempt_id",
+            "address_hash": f"eq.{address_hash}",
+            "attempted_at": f"gt.{cutoff}",
+            "limit": str(MAX_SIGN_IN_FAILURE_REPORTS),
+        })
+        if not isinstance(recent, list):
+            raise ApiError(502, "Security activity storage returned an invalid response.")
+        if len(recent) >= MAX_SIGN_IN_FAILURE_REPORTS:
+            self._send_json(202, {"ok": True, "recorded": False})
+            return
+        _supabase_request(
+            "/rest/v1/chat_api_failed_logins",
+            method="POST",
+            body={
+                "attempt_id": secrets.token_urlsafe(18),
+                "address_hash": address_hash,
+            },
+        )
+        if _allow_security_event(self, "client_reported_sign_in_failure"):
+            _write_security_event(
+                self,
+                "client_reported_sign_in_failure",
+                "/api/auth/sign-in",
+                401,
+            )
+        self._send_json(202, {"ok": True, "recorded": True})
+
+    def _list_security_events(self):
+        self._require_admin_session()
+        rows = _supabase_request("/rest/v1/chat_api_security_events", query={
+            "select": "event_id,created_at,event_type,request_method,request_path,status_code,address_hash",
+            "order": "created_at.desc",
+            "limit": str(SECURITY_EVENT_LIST_LIMIT),
+        })
+        if not isinstance(rows, list):
+            raise ApiError(502, "Security activity storage returned an invalid response.")
+        events = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source_hash = row.get("address_hash")
+            events.append({
+                "id": row.get("event_id"),
+                "occurredAt": row.get("created_at"),
+                "type": row.get("event_type"),
+                "method": row.get("request_method"),
+                "path": row.get("request_path"),
+                "status": row.get("status_code"),
+                "sourceHash": source_hash[:12] if isinstance(source_hash, str) else "",
+            })
+        self._send_json(200, {"events": events})
 
     def _logout(self):
         token = self.headers.get("Authorization", "").partition(" ")[2]

@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -53,6 +54,8 @@ class ServerApiTests(unittest.TestCase):
             "encrypted_text": "PM3." + "A" * 45,
         }]
         self.rooms = {}
+        self.security_events = []
+        self.failed_logins = []
         self.legacy_room_codes = {"123456"}
         self.members = set()
         self.supabase = patch.object(server, "_supabase_request", side_effect=self.fake_supabase)
@@ -71,6 +74,33 @@ class ServerApiTests(unittest.TestCase):
         table = path.rsplit("/", 1)[-1]
         room_code = query.get("room_code", "").removeprefix("eq.")
         sender_id = query.get("sender_id", "").removeprefix("eq.")
+        if table == "chat_api_security_events":
+            if method == "GET":
+                rows = sorted(self.security_events, key=lambda row: row["created_at"], reverse=True)
+                return rows[:int(query.get("limit", "100"))]
+            if method == "POST":
+                row = dict(body)
+                row.setdefault("created_at", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+                self.security_events.append(row)
+                return None
+            if method == "DELETE":
+                return None
+        if table == "chat_api_failed_logins":
+            if method == "GET":
+                address_hash = query.get("address_hash", "").removeprefix("eq.")
+                cutoff = query.get("attempted_at", "").removeprefix("gt.")
+                rows = [
+                    row for row in self.failed_logins
+                    if row["address_hash"] == address_hash and row["attempted_at"] > cutoff
+                ]
+                return rows[:int(query.get("limit", "100"))]
+            if method == "POST":
+                row = dict(body)
+                row.setdefault("attempted_at", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+                self.failed_logins.append(row)
+                return None
+            if method == "DELETE":
+                return None
         if table == "chat_api_rooms":
             if method == "GET":
                 room = self.rooms.get(room_code)
@@ -220,6 +250,78 @@ class ServerApiTests(unittest.TestCase):
         )
         self.assertEqual(status_code, 401)
         self.assertIn("sign-in failed", payload["error"])
+
+    def test_failed_sign_in_reports_are_limited_and_do_not_contain_credentials(self):
+        results = [
+            self.request(
+                "/api/security/report-login-failure",
+                method="POST",
+                payload={},
+            )
+            for _ in range(server.MAX_SIGN_IN_FAILURE_REPORTS + 1)
+        ]
+
+        self.assertTrue(all(status == 202 for status, _ in results))
+        self.assertTrue(all(payload["ok"] for _, payload in results))
+        self.assertTrue(all(payload["recorded"] for _, payload in results[:-1]))
+        self.assertFalse(results[-1][1]["recorded"])
+        self.assertEqual(len(self.security_events), 1)
+        self.assertEqual(len(self.failed_logins), server.MAX_SIGN_IN_FAILURE_REPORTS + 1)
+        event = self.security_events[0]
+        self.assertEqual(event["event_type"], "client_reported_sign_in_failure")
+        self.assertEqual(event["request_path"], "/api/auth/sign-in")
+        self.assertEqual(event["status_code"], 401)
+        self.assertNotIn("password", event)
+        self.assertNotIn("email", event)
+        self.assertNotEqual(event["address_hash"], "127.0.0.1")
+
+    def test_invalid_room_code_is_logged_without_raw_address(self):
+        token = self.sign_in()
+
+        status_code, _ = self.join_room(token, "999999")
+
+        self.assertEqual(status_code, 404)
+        event = next(
+            item for item in self.security_events
+            if item["event_type"] == "invalid_room_code"
+        )
+        self.assertEqual(event["request_path"], "/api/rooms/join")
+        self.assertNotEqual(event["address_hash"], "127.0.0.1")
+
+    def test_security_activity_is_admin_only_and_masks_address_hash(self):
+        non_admin_token = self.sign_in()
+        status_code, _ = self.request(
+            "/api/admin/security-events",
+            token=non_admin_token,
+        )
+        self.assertEqual(status_code, 403)
+
+        self.auth_user.return_value = {
+            "id": TEST_SENDER_ID,
+            "email": "admin@example.com",
+        }
+        admin_token = self.sign_in()
+        self.security_events.clear()
+        self.security_events.append({
+            "event_id": "event-1",
+            "created_at": "2026-11-12T12:00:00Z",
+            "event_type": "forbidden_request",
+            "request_method": "POST",
+            "request_path": "/api/admin/accounts",
+            "status_code": 403,
+            "address_hash": "a" * 64,
+        })
+
+        status_code, payload = self.request(
+            "/api/admin/security-events",
+            token=admin_token,
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(payload["events"][0]["type"], "forbidden_request")
+        self.assertEqual(payload["events"][0]["sourceHash"], "a" * 12)
+        self.assertNotIn("address_hash", payload["events"][0])
 
     def test_anonymous_supabase_user_cannot_create_an_app_session(self):
         self.auth_user_patch.stop()
@@ -492,7 +594,7 @@ class ServerApiTests(unittest.TestCase):
         with patch.object(server, "_supabase_auth_user_details", return_value={
             "id": TEST_SENDER_ID,
             "email": "not-admin@example.com",
-        }), patch.object(server, "_supabase_request") as create_user:
+        }), patch.object(server, "_supabase_request", side_effect=self.fake_supabase) as create_user:
             status_code, payload = self.request(
                 "/api/admin/accounts",
                 method="POST",
@@ -507,7 +609,10 @@ class ServerApiTests(unittest.TestCase):
 
         self.assertEqual(status_code, 403)
         self.assertIn("administrator", payload["error"])
-        create_user.assert_not_called()
+        self.assertFalse(any(
+            call.args[0] == "/auth/v1/admin/users"
+            for call in create_user.call_args_list
+        ))
 
     def test_room_membership_is_required_for_messages_and_renaming(self):
         token = self.sign_in()

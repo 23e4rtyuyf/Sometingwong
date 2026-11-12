@@ -12,6 +12,10 @@ and room membership feature additionally requires
 `supabase/migrations/20261111000100_chat_api_rooms.sql`. Run the new room
 migration in the Supabase SQL Editor.
 
+The admin-only security activity panel additionally requires
+`supabase/migrations/20261112000100_chat_api_security_events.sql`. Run it in
+the Supabase SQL Editor before deploying the updated Edge Function.
+
 These migrations add private tables without changing or deleting the existing
 `messages` table. The new tables deny access to `anon` and `authenticated`;
 only the function's service-role key can use them. Room messages are readable
@@ -45,24 +49,20 @@ not receive a verification email. Share their temporary passwords privately.
 
 ## 4. Deploy the function
 
-The source is `supabase/functions/chat-api/index.ts`. For a version-controlled
-deployment, use the Supabase CLI from a trusted terminal:
-
-```sh
-supabase login
-supabase link --project-ref iozdwksqfhlhcrbhrwfl
-supabase functions deploy chat-api --no-verify-jwt
-```
+The source is `supabase/functions/chat-api/index.ts`. This app calls the
+existing deployed URL ending in `/functions/v1/swift-endpoint`; update that
+existing function rather than creating a second function. In the Dashboard,
+open **Edge Functions → Functions → swift-endpoint → Code**, replace the code
+with the versioned source, then save and deploy it.
 
 The `verify_jwt = false` setting in `supabase/config.toml` is intentional:
 Supabase's gateway must pass the request to the function, where this app checks
 the signed-in Supabase account and its server-side session. Do not remove those
 checks or expose the service-role key.
 
-The Supabase Dashboard also supports deploying a function through its editor.
-If using it, paste the versioned function source above and turn off **Verify
-JWT** for this function. The Dashboard editor does not keep its edits in this
-GitHub repository.
+Keep **Verify JWT** off for this function. The Dashboard editor does not keep
+its edits in this GitHub repository. Avoid deploying `chat-api` under a new
+slug unless you also change `api-config.js` to the new endpoint.
 
 ## 5. Check the function and room features
 
@@ -80,6 +80,16 @@ The function source handles subpaths independently of that slug. Confirm
 GitHub Pages app, sign in, create two rooms, and confirm both appear in the chat
 list. An account administrator can also create a confirmed account through
 **Add account**.
+
+## 6. Review security activity
+
+After running the security-events migration and deploying the updated function,
+an allowlisted administrator can open **Security log** in the app. It shows
+recent API security events and grouped, one-way address hashes; it never shows
+raw IP addresses, credentials, room codes, or message contents. Failed password
+sign-ins are reported by the browser and are marked as unverified reports.
+Supabase's full Edge Function runtime logs remain available in the Dashboard
+under **Edge Functions → Functions → your function → Logs**.
 
 `api-config.js` uses the function base URL and public Supabase publishable key.
 Never put the service-role key in browser code. The browser client sends the
