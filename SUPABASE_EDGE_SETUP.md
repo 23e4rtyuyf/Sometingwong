@@ -15,6 +15,10 @@ migration in the Supabase SQL Editor.
 The admin-only security activity panel additionally requires
 `supabase/migrations/20261112000100_chat_api_security_events.sql`. Run it in
 the Supabase SQL Editor before deploying the updated Edge Function.
+To include raw client IPs and account identifiers in the admin log, also run
+`supabase/migrations/20261112000200_chat_api_security_event_identifiers.sql`
+after the first security-events migration and before deploying the updated
+function.
 
 These migrations add private tables without changing or deleting the existing
 `messages` table. The new tables deny access to `anon` and `authenticated`;
@@ -83,11 +87,13 @@ list. An account administrator can also create a confirmed account through
 
 ## 6. Review security activity
 
-After running the security-events migration and deploying the updated function,
+After running both security-event migrations and deploying the updated function,
 an allowlisted administrator can open **Security log** in the app. It shows
-recent API security events and grouped, one-way address hashes; it never shows
-raw IP addresses, credentials, room codes, or message contents. Failed password
-sign-ins are reported by the browser and are marked as unverified reports.
+recent API security events, raw client IPs, and account IDs/emails when available.
+Failed sign-in email addresses are browser-reported and unverified. Passwords,
+access passwords, tokens, room codes, and message contents are not included.
+The new IP and account columns remain protected by the existing service-role-only
+table permissions and the admin-only endpoint.
 Supabase's full Edge Function runtime logs remain available in the Dashboard
 under **Edge Functions → Functions → your function → Logs**.
 

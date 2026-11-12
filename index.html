@@ -175,7 +175,7 @@
         <p>By accessing or using the Private Messages application (the “Platform”), you agree to these Terms of Service. If you do not agree, do not use the Platform.</p>
         <h2>2. Privacy and data security</h2>
         <p>The Platform encrypts message contents on your device before they are sent to the database. Schools, school districts, educational institutions, and their administrators and employees are expressly prohibited from using the Platform or attempting to access, monitor, intercept, or decrypt any account or message. They may not direct, assist, or authorize another person to do so. They may not pressure, threaten, or retaliate against a student to obtain private messages, credentials, room codes, or account access, or punish a student solely for using the Platform or refusing to disclose private communications. All such conduct is expressly unauthorized by the Platform. Attempts by any person to bypass encryption or access an account without its owner’s consent are also prohibited by these Terms.</p>
-        <p><strong>Security activity logging:</strong> To detect misuse and investigate technical issues, the Platform records selected API security events. Each entry includes the event type, time, HTTP method, API path, response status, and, when available, a one-way keyed hash of the source address to group related requests. The in-app security log does not contain raw IP addresses, account IDs or email addresses, room codes, passwords, access passwords, authentication tokens, cookies, encryption keys, message contents, or message ciphertext. Failed sign-in entries are reports from the browser and may not be independently verified. Only approved administrators can view the in-app security log. Records older than 30 days are pruned during sign-in or administrator log review. Hosting and authentication providers may separately process technical or account data under their own policies.</p>
+        <p><strong>Security activity logging:</strong> To detect misuse and investigate technical issues, the Platform records selected API security events. Entries may include the event type, time, HTTP method, API path, response status, raw client IP address, and authenticated account ID and email. Failed sign-in entries may include the email submitted in the browser; those reports are not independently verified. Only approved administrators can view the in-app security log. The log does not contain account passwords, access passwords, authentication tokens, cookies, encryption keys, message contents, or message ciphertext. Records older than 30 days are pruned during sign-in or administrator log review. Hosting and authentication providers may separately process technical or account data under their own policies.</p>
         <p>Encryption is not a guarantee against monitoring or disclosure. The Platform cannot prevent monitoring of your device, browser, account, or network; protect a compromised device; or control what a school or network operator does. Room codes, room names, nicknames, and message timing may be visible to the service.</p>
         <p>Where practicable and permitted by law, the Platform may restrict access in response to misuse or attempts to compromise user privacy. The Platform cannot guarantee that it can identify or block every third party.</p>
         <h2>3. Disclaimer of warranties</h2>
@@ -240,8 +240,8 @@
   </dialog>
   <dialog id="securityDialog" class="security-dialog" aria-labelledby="securityDialogTitle">
     <h2 id="securityDialogTitle">Security activity</h2>
-    <p class="small">Recent failed or blocked requests to the chat API. Source groups use one-way hashes; raw IP addresses, messages, passwords, and tokens are not shown.</p>
-    <p class="small">Failed account-password sign-ins are reported by the browser and are not independently verified here. Full Edge Function runtime logs are in Supabase Dashboard → Edge Functions → your function → Logs.</p>
+    <p class="small">Recent failed or blocked requests. Raw client IPs and account identifiers are shown when available. Passwords, tokens, and message contents are never shown.</p>
+    <p class="small">Failed sign-in reports include the email entered in the browser and may be inaccurate. Full Edge Function runtime logs are in Supabase Dashboard → Edge Functions → your function → Logs.</p>
     <p id="securityStatus" class="status" role="status" aria-live="polite"></p>
     <div id="securityEvents" class="security-events" aria-live="polite"></div>
     <div class="dialog-actions">
@@ -461,7 +461,7 @@ async function signInWithAccount(email, password) {
     try {
       await apiRequest('/api/security/report-login-failure', {
         method: 'POST',
-        body: '{}',
+        body: JSON.stringify({ email }),
       }, false);
     } catch {
       // A failed log report must not change the sign-in error shown to the user.
@@ -1489,10 +1489,29 @@ function renderSecurityEvents(events) {
       : 'Time unavailable';
     details.textContent = `${event.method || 'Request'} ${event.path || ''} · ${dateText}`;
     card.append(header, details);
+    const ip = document.createElement('p');
+    ip.className = 'small';
+    ip.textContent = `Client IP: ${event.clientIp || 'unavailable'}`;
+    card.append(ip);
+    const account = document.createElement('p');
+    account.className = 'small';
+    if (event.accountEmail) {
+      const label = event.type === 'client_reported_sign_in_failure'
+        ? 'Reported email (unverified)'
+        : 'Account email';
+      account.textContent = `${label}: ${event.accountEmail}`;
+    } else {
+      account.textContent = 'Account email: unavailable';
+    }
+    card.append(account);
+    const accountId = document.createElement('p');
+    accountId.className = 'small';
+    accountId.textContent = `Account ID: ${event.accountId || 'unavailable'}`;
+    card.append(accountId);
     if (event.sourceHash) {
       const source = document.createElement('p');
       source.className = 'small';
-      source.textContent = `Anonymous source group: ${event.sourceHash}`;
+      source.textContent = `Source group: ${event.sourceHash}`;
       card.append(source);
     }
     list.append(card);

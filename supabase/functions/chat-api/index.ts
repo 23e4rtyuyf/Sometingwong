@@ -130,12 +130,35 @@ async function hashForStorage(secret, value) {
   return encodeBase64Url(await hmac(secret, value));
 }
 
+function normalizedIpAddress(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate || candidate.length > 64) return "";
+  const ipv4 = candidate.split(".");
+  if (ipv4.length === 4 && ipv4.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)) {
+    return ipv4.map(Number).join(".");
+  }
+  const ipv6 = candidate.startsWith("[") && candidate.endsWith("]")
+    ? candidate.slice(1, -1)
+    : candidate;
+  if (!ipv6.includes(":") || !/^[0-9a-f:.]+$/i.test(ipv6)) return "";
+  try {
+    const host = new URL(`http://[${ipv6}]/`).hostname;
+    return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : "";
+  } catch {
+    return "";
+  }
+}
+
 function clientAddress(request) {
-  const cloudflareAddress = request.headers.get("cf-connecting-ip") || "";
-  if (cloudflareAddress.trim()) return cloudflareAddress.trim();
+  const cloudflareAddress = normalizedIpAddress(request.headers.get("cf-connecting-ip"));
+  if (cloudflareAddress) return cloudflareAddress;
   const forwarded = request.headers.get("x-forwarded-for") || "";
   const forwardedAddresses = forwarded.split(",").map((value) => value.trim()).filter(Boolean);
-  return forwardedAddresses.at(-1) || "unknown";
+  for (const candidate of forwardedAddresses.reverse()) {
+    const address = normalizedIpAddress(candidate);
+    if (address) return address;
+  }
+  return "unknown";
 }
 
 async function readJson(request) {
@@ -251,11 +274,23 @@ function safeSecurityPath(route) {
   return path.startsWith("/api/") ? path : "/api/unknown";
 }
 
-async function writeSecurityEvent(request, route, eventType, status) {
+function securityEmail(value) {
+  if (typeof value !== "string") return null;
+  const email = value.trim().toLowerCase();
+  return email.length <= 254 && /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/.test(email)
+    ? email
+    : null;
+}
+
+async function writeSecurityEvent(request, route, eventType, status, identity = {}) {
   const settings = config();
   const address = clientAddress(request);
   const addressHash = address !== "unknown" && settings.sessionSecret
     ? await hashForStorage(settings.sessionSecret, `security-event-ip:${address}`)
+    : null;
+  const accountId = typeof identity.accountId === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identity.accountId)
+    ? identity.accountId.toLowerCase()
     : null;
   await supabaseRequest("chat_api_security_events", {}, {
     method: "POST",
@@ -266,6 +301,9 @@ async function writeSecurityEvent(request, route, eventType, status) {
       request_path: safeSecurityPath(route),
       status_code: status,
       address_hash: addressHash,
+      client_ip: address === "unknown" ? null : address,
+      account_id: accountId,
+      account_email: securityEmail(identity.accountEmail),
     },
     prefer: "return=minimal",
   });
@@ -301,11 +339,25 @@ async function allowSecurityEvent(request, eventType) {
   return true;
 }
 
-async function recordSecurityEvent(request, route, eventType, status) {
+async function securityAccountIdentity(request) {
   try {
-    if (await allowSecurityEvent(request, eventType)) {
-      await writeSecurityEvent(request, route, eventType, status);
-    }
+    const session = await requireSession(request);
+    const user = await supabaseAdminUserById(session.sender_id);
+    if (user?.id !== session.sender_id) return {};
+    return {
+      accountId: session.sender_id,
+      accountEmail: securityEmail(user.email),
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function recordSecurityEvent(request, route, eventType, status, identity = null) {
+  try {
+    if (!await allowSecurityEvent(request, eventType)) return;
+    const account = identity || await securityAccountIdentity(request);
+    await writeSecurityEvent(request, route, eventType, status, account);
   } catch {
     console.error("[chat-api] Security event could not be recorded.");
   }
@@ -313,9 +365,11 @@ async function recordSecurityEvent(request, route, eventType, status) {
 
 async function reportSignInFailure(request) {
   const body = await readJson(request);
-  if (Object.keys(body).length !== 0) {
+  if (Object.keys(body).length !== 1 || !Object.hasOwn(body, "email")) {
     throw new ApiError(400, "Unexpected sign-in report data.");
   }
+  const email = securityEmail(body.email);
+  if (!email) throw new ApiError(400, "A valid account email is required.");
   const settings = config();
   const address = clientAddress(request);
   if (!settings.serviceKey || !settings.sessionSecret || address === "unknown") {
@@ -353,6 +407,7 @@ async function reportSignInFailure(request) {
     "/api/auth/sign-in",
     "client_reported_sign_in_failure",
     401,
+    { accountEmail: email },
   );
   return { ok: true, recorded: true };
 }
@@ -521,7 +576,7 @@ async function listSecurityEvents(request) {
   await requireChatAdmin(request);
   await cleanupExpiredRows();
   const rows = await supabaseRequest("chat_api_security_events", {
-    select: "event_id,created_at,event_type,request_method,request_path,status_code,address_hash",
+    select: "event_id,created_at,event_type,request_method,request_path,status_code,address_hash,client_ip,account_id,account_email",
     order: "created_at.desc",
     limit: String(SECURITY_EVENT_LIST_LIMIT),
   });
@@ -536,6 +591,9 @@ async function listSecurityEvents(request) {
       method: event.request_method,
       path: event.request_path,
       status: event.status_code,
+      clientIp: event.client_ip,
+      accountId: event.account_id,
+      accountEmail: event.account_email,
       sourceHash: typeof event.address_hash === "string"
         ? event.address_hash.slice(0, 12)
         : "",

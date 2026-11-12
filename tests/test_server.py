@@ -251,12 +251,12 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(status_code, 401)
         self.assertIn("sign-in failed", payload["error"])
 
-    def test_failed_sign_in_reports_are_limited_and_do_not_contain_credentials(self):
+    def test_failed_sign_in_reports_are_limited_and_include_only_reported_email(self):
         results = [
             self.request(
                 "/api/security/report-login-failure",
                 method="POST",
-                payload={},
+                payload={"email": " Person@Example.com "},
             )
             for _ in range(server.MAX_SIGN_IN_FAILURE_REPORTS + 1)
         ]
@@ -271,11 +271,21 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(event["event_type"], "client_reported_sign_in_failure")
         self.assertEqual(event["request_path"], "/api/auth/sign-in")
         self.assertEqual(event["status_code"], 401)
-        self.assertNotIn("password", event)
-        self.assertNotIn("email", event)
+        self.assertEqual(event["account_email"], "person@example.com")
+        self.assertIsNone(event["account_id"])
+        self.assertEqual(event["client_ip"], "127.0.0.1")
         self.assertNotEqual(event["address_hash"], "127.0.0.1")
 
-    def test_invalid_room_code_is_logged_without_raw_address(self):
+    def test_failed_sign_in_report_rejects_password_fields(self):
+        status_code, _ = self.request(
+            "/api/security/report-login-failure",
+            method="POST",
+            payload={"email": "user@example.com", "password": "must-not-be-logged"},
+        )
+        self.assertEqual(status_code, 400)
+        self.assertEqual(self.security_events, [])
+
+    def test_invalid_room_code_logs_ip_and_verified_account_identity(self):
         token = self.sign_in()
 
         status_code, _ = self.join_room(token, "999999")
@@ -286,6 +296,9 @@ class ServerApiTests(unittest.TestCase):
             if item["event_type"] == "invalid_room_code"
         )
         self.assertEqual(event["request_path"], "/api/rooms/join")
+        self.assertEqual(event["client_ip"], "127.0.0.1")
+        self.assertEqual(event["account_id"], TEST_SENDER_ID)
+        self.assertEqual(event["account_email"], "user@example.com")
         self.assertNotEqual(event["address_hash"], "127.0.0.1")
 
     def test_security_activity_is_admin_only_and_masks_address_hash(self):
@@ -310,6 +323,9 @@ class ServerApiTests(unittest.TestCase):
             "request_path": "/api/admin/accounts",
             "status_code": 403,
             "address_hash": "a" * 64,
+            "client_ip": "192.0.2.7",
+            "account_id": TEST_SENDER_ID,
+            "account_email": "admin@example.com",
         })
 
         status_code, payload = self.request(
@@ -321,6 +337,9 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(len(payload["events"]), 1)
         self.assertEqual(payload["events"][0]["type"], "forbidden_request")
         self.assertEqual(payload["events"][0]["sourceHash"], "a" * 12)
+        self.assertEqual(payload["events"][0]["clientIp"], "192.0.2.7")
+        self.assertEqual(payload["events"][0]["accountId"], TEST_SENDER_ID)
+        self.assertEqual(payload["events"][0]["accountEmail"], "admin@example.com")
         self.assertNotIn("address_hash", payload["events"][0])
 
     def test_anonymous_supabase_user_cannot_create_an_app_session(self):

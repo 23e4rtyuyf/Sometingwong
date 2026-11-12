@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -185,6 +186,13 @@ def _security_address_hash(namespace, address):
     return hmac.new(secret, message, hashlib.sha256).hexdigest()
 
 
+def _security_email(value):
+    if not isinstance(value, str):
+        return None
+    email = value.strip().lower()
+    return email if len(email) <= 254 and re.fullmatch(r"[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+", email) else None
+
+
 def _allow_security_event(handler, event_type):
     address = handler.client_address[0] if handler.client_address else ""
     if not address or not os.environ.get("SESSION_SECRET"):
@@ -212,11 +220,25 @@ def _allow_security_event(handler, event_type):
     return True
 
 
-def _write_security_event(handler, event_type, path, status):
+def _write_security_event(handler, event_type, path, status, identity=None):
     clean_path = re.sub(r"[^A-Za-z0-9/_-]", "", str(path))[:120]
     if not clean_path.startswith("/api/"):
         clean_path = "/api/unknown"
     address = handler.client_address[0] if handler.client_address else ""
+    try:
+        client_ip = str(ipaddress.ip_address(address))
+    except ValueError:
+        client_ip = None
+    identity = identity or {}
+    account_id = identity.get("account_id")
+    if not isinstance(account_id, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        account_id,
+        re.IGNORECASE,
+    ):
+        account_id = None
+    else:
+        account_id = account_id.lower()
     address_hash = _security_address_hash("security-event-ip", address)
     _supabase_request(
         "/rest/v1/chat_api_security_events",
@@ -228,6 +250,9 @@ def _write_security_event(handler, event_type, path, status):
             "request_path": clean_path,
             "status_code": status,
             "address_hash": address_hash,
+            "client_ip": client_ip,
+            "account_id": account_id,
+            "account_email": _security_email(identity.get("account_email")),
         },
     )
 
@@ -315,13 +340,29 @@ class SiteHandler(BaseHTTPRequestHandler):
             raise ApiError(403, "Only an approved account administrator can view security activity.")
         return session
 
+    def _security_account_identity(self):
+        try:
+            session = self._require_session()
+        except ApiError:
+            return {}
+        return {
+            "account_id": session.get("sender_id"),
+            "account_email": session.get("sender_email"),
+        }
+
     def _record_security_failure(self, path, status):
         event_type = _security_event_type(path, status)
         if not event_type:
             return
         try:
             if _allow_security_event(self, event_type):
-                _write_security_event(self, event_type, path, status)
+                _write_security_event(
+                    self,
+                    event_type,
+                    path,
+                    status,
+                    self._security_account_identity(),
+                )
         except Exception:
             print("[chat-api] Security event could not be recorded.", flush=True)
 
@@ -442,6 +483,7 @@ class SiteHandler(BaseHTTPRequestHandler):
         with _lock:
             _sessions[session_key] = {
                 "sender_id": sender_id,
+                "sender_email": _security_email(user.get("email")),
                 "expires": expires,
                 "is_admin": is_admin,
             }
@@ -449,8 +491,11 @@ class SiteHandler(BaseHTTPRequestHandler):
 
     def _report_sign_in_failure(self):
         body = self._read_body()
-        if body:
+        if set(body) != {"email"}:
             raise ApiError(400, "Unexpected sign-in report data.")
+        email = _security_email(body.get("email"))
+        if not email:
+            raise ApiError(400, "A valid account email is required.")
         secret = os.environ.get("SESSION_SECRET", "")
         address = self.client_address[0] if self.client_address else ""
         if not secret or not address or not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
@@ -485,6 +530,7 @@ class SiteHandler(BaseHTTPRequestHandler):
                 "client_reported_sign_in_failure",
                 "/api/auth/sign-in",
                 401,
+                {"account_email": email},
             )
         self._send_json(202, {"ok": True, "recorded": True})
 
@@ -495,7 +541,7 @@ class SiteHandler(BaseHTTPRequestHandler):
         except Exception:
             print("[chat-api] Expired security activity could not be cleaned up.", flush=True)
         rows = _supabase_request("/rest/v1/chat_api_security_events", query={
-            "select": "event_id,created_at,event_type,request_method,request_path,status_code,address_hash",
+            "select": "event_id,created_at,event_type,request_method,request_path,status_code,address_hash,client_ip,account_id,account_email",
             "order": "created_at.desc",
             "limit": str(SECURITY_EVENT_LIST_LIMIT),
         })
@@ -513,6 +559,9 @@ class SiteHandler(BaseHTTPRequestHandler):
                 "method": row.get("request_method"),
                 "path": row.get("request_path"),
                 "status": row.get("status_code"),
+                "clientIp": row.get("client_ip"),
+                "accountId": row.get("account_id"),
+                "accountEmail": row.get("account_email"),
                 "sourceHash": source_hash[:12] if isinstance(source_hash, str) else "",
             })
         self._send_json(200, {"events": events})
