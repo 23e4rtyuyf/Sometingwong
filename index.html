@@ -1023,7 +1023,7 @@ function subscribe() {
     } catch (error) {
       status(error.message);
     }
-  }, 5000);
+  }, 1000);
   status(localHistorySaved
     ? 'Chat connected. Messages are being saved on this device.'
     : 'Chat connected. Local history could not be saved in this browser.');
