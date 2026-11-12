@@ -416,7 +416,7 @@ async function reportSignInFailure(request) {
     if (match && typeof match === "object") {
       identity = {
         accountId: match.account_id,
-        accountEmail: securityEmail(match.account_email) || email,
+        accountEmail: email,
       };
     }
   } catch {

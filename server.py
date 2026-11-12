@@ -546,9 +546,7 @@ class SiteHandler(BaseHTTPRequestHandler):
                     if isinstance(matched, dict):
                         identity = {
                             "account_id": matched.get("account_id"),
-                            "account_email": _security_email(
-                                matched.get("account_email")
-                            ) or email,
+                            "account_email": email,
                         }
             except ApiError:
                 # Keep the failed-login event even if account matching is unavailable.

@@ -182,7 +182,7 @@
         <p>By accessing or using the Private Messages application (the “Platform”), you agree to these Terms of Service. If you do not agree, do not use the Platform.</p>
         <h2>2. Privacy and data security</h2>
         <p>The Platform encrypts message contents on your device before they are sent to the database. Schools, school districts, educational institutions, and their administrators and employees are expressly prohibited from using the Platform or attempting to access, monitor, intercept, or decrypt any account or message. They may not direct, assist, or authorize another person to do so. They may not pressure, threaten, or retaliate against a student to obtain private messages, credentials, room codes, or account access, or punish a student solely for using the Platform or refusing to disclose private communications. All such conduct is expressly unauthorized by the Platform. Attempts by any person to bypass encryption or access an account without its owner’s consent are also prohibited by these Terms.</p>
-        <p><strong>Security activity logging:</strong> To detect misuse and investigate security incidents, the Platform records selected API security events. Entries may include the event type, time, HTTP method, API path, response status, raw client IP address, and account ID and email when available. For failed sign-ins, the Platform may compare the submitted email with account records and record the matching account email and ID. This identifies the account targeted by the attempt, not the person who made it; an unmatched submitted email is unverified. Only approved administrators can view the in-app security log. The log does not contain account passwords, access passwords, authentication tokens, cookies, encryption keys, message contents, or message ciphertext. Records older than 30 days are pruned during sign-in or administrator log review. Hosting and authentication providers may separately process technical or account data under their own policies.</p>
+        <p><strong>Security activity logging:</strong> To detect misuse and investigate security incidents, the Platform records selected API security events. Entries may include the event type, time, HTTP method, API path, response status, raw client IP address, and account ID and email when available. For failed sign-ins, the Platform records the submitted email and may match it to an account ID. The submitted email is not proof of who made the attempt; the matched ID identifies the account targeted, not the person who entered the email. Only approved administrators can view the in-app security log. The log does not contain account passwords, access passwords, authentication tokens, cookies, encryption keys, message contents, or message ciphertext. Records older than 30 days are pruned during sign-in or administrator log review. Hosting and authentication providers may separately process technical or account data under their own policies.</p>
         <p>Encryption is not a guarantee against monitoring or disclosure. The Platform cannot prevent monitoring of your device, browser, account, or network; protect a compromised device; or control what a school or network operator does. Room codes, room names, nicknames, and message timing may be visible to the service.</p>
         <p>Where practicable and permitted by law, the Platform may restrict access in response to misuse or attempts to compromise user privacy. The Platform cannot guarantee that it can identify or block every third party.</p>
         <h2>3. Disclaimer of warranties</h2>
@@ -247,7 +247,7 @@
   </dialog>
   <dialog id="securityDialog" class="security-dialog" aria-labelledby="securityDialogTitle">
     <h2 id="securityDialogTitle">Security activity</h2>
-    <p class="small">Entries show request time, method, path, status, raw client IP, and account details when available. A failed sign-in may show the matched account targeted by the attempt; this does not identify who entered the credentials. Delete one entry at a time. Passwords, tokens, and message contents are never shown.</p>
+    <p class="small">Entries show request time, method, path, status, raw client IP, and account details when available. Failed sign-ins show the submitted email, plus a matched account ID when available. This does not identify who entered the credentials. Delete one entry at a time. Passwords, tokens, and message contents are never shown.</p>
     <p class="small">Full Edge Function runtime logs are in Supabase Dashboard → Edge Functions → your function → Logs.</p>
     <p id="securityStatus" class="status" role="status" aria-live="polite"></p>
     <div id="securityEvents" class="security-events" aria-live="polite"></div>
@@ -1671,9 +1671,7 @@ function renderSecurityEvents(events) {
     account.className = 'small';
     const isReportedSignInFailure = event.type === 'client_reported_sign_in_failure';
     if (isReportedSignInFailure) {
-      account.textContent = event.accountId
-        ? `Matched account email (attempt target): ${event.accountEmail || 'unavailable'}`
-        : `Reported email (unverified): ${event.accountEmail || 'unavailable'}`;
+      account.textContent = `Attempted email (unverified): ${event.accountEmail || 'unavailable'}`;
     } else {
       account.textContent = `Account email: ${event.accountEmail || 'unavailable'}`;
     }
