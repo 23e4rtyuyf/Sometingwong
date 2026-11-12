@@ -9,7 +9,6 @@ const MAX_SIGN_IN_FAILURE_REPORTS = 5;
 const SECURITY_EVENT_RETENTION_DAYS = 30;
 const SECURITY_EVENT_LIST_LIMIT = 100;
 const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const CURSOR_TIMESTAMP_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/;
 const encoder = new TextEncoder();
 
 class ApiError extends Error {
@@ -877,7 +876,6 @@ async function unreadMessageCount(request) {
   if (afterTimes.length > 1 || afterIds.length > 1
     || (afterIds.length > 0 && !afterCreatedAt)
     || (afterCreatedAt && (afterCreatedAt.length > 40
-      || !CURSOR_TIMESTAMP_RE.test(afterCreatedAt)
       || !Number.isFinite(Date.parse(afterCreatedAt))
       || (afterId && !MESSAGE_ID_RE.test(afterId))))) {
     throw new ApiError(400, "Invalid unread-message cursor.");
@@ -895,9 +893,7 @@ async function unreadMessageCount(request) {
     }
     return {
       unreadCount: 0,
-      latestMessage: latest[0] && typeof latest[0] === "object"
-        ? { id: latest[0].id, created_at: latest[0].created_at }
-        : null,
+      latestMessage: latest[0] || null,
       baselineAt: new Date().toISOString(),
     };
   }
