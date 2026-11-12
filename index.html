@@ -1669,15 +1669,17 @@ function renderSecurityEvents(events) {
     card.append(ip);
     const account = document.createElement('p');
     account.className = 'small';
-    if (event.accountEmail) {
-      const label = event.type === 'client_reported_sign_in_failure'
-        ? 'Reported email (unverified)'
-        : 'Account email';
-      account.textContent = `${label}: ${event.accountEmail}`;
-    } else {
-      account.textContent = 'Account email: unavailable';
-    }
+    const isReportedSignInFailure = event.type === 'client_reported_sign_in_failure';
+    account.textContent = `Account email: ${!isReportedSignInFailure && event.accountEmail
+      ? event.accountEmail
+      : 'unavailable'}`;
     card.append(account);
+    if (isReportedSignInFailure && event.accountEmail) {
+      const reportedEmail = document.createElement('p');
+      reportedEmail.className = 'small';
+      reportedEmail.textContent = `Reported email (unverified): ${event.accountEmail}`;
+      card.append(reportedEmail);
+    }
     const accountId = document.createElement('p');
     accountId.className = 'small';
     accountId.textContent = `Account ID: ${event.accountId || 'unavailable'}`;
