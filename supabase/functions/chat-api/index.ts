@@ -402,12 +402,32 @@ async function reportSignInFailure(request) {
     },
     prefer: "return=minimal",
   });
+  let identity = { accountEmail: email };
+  try {
+    const matches = await supabaseRequest(
+      "rpc/lookup_chat_account_by_email",
+      {},
+      {
+        method: "POST",
+        body: { email_to_find: email },
+      },
+    );
+    const match = Array.isArray(matches) ? matches[0] : null;
+    if (match && typeof match === "object") {
+      identity = {
+        accountId: match.account_id,
+        accountEmail: securityEmail(match.account_email) || email,
+      };
+    }
+  } catch {
+    // Keep the failed-login event even when account matching is unavailable.
+  }
   await recordSecurityEvent(
     request,
     "/api/auth/sign-in",
     "client_reported_sign_in_failure",
     401,
-    { accountEmail: email },
+    identity,
   );
   return { ok: true, recorded: true };
 }

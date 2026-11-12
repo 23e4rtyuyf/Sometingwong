@@ -74,6 +74,13 @@ class ServerApiTests(unittest.TestCase):
         table = path.rsplit("/", 1)[-1]
         room_code = query.get("room_code", "").removeprefix("eq.")
         sender_id = query.get("sender_id", "").removeprefix("eq.")
+        if path == "/rest/v1/rpc/lookup_chat_account_by_email":
+            if body.get("email_to_find") == "user@example.com":
+                return [{
+                    "account_id": TEST_SENDER_ID,
+                    "account_email": "user@example.com",
+                }]
+            return []
         if table == "chat_api_security_events":
             if method == "GET":
                 rows = sorted(self.security_events, key=lambda row: row["created_at"], reverse=True)
@@ -314,6 +321,20 @@ class ServerApiTests(unittest.TestCase):
         )
         self.assertEqual(status_code, 400)
         self.assertEqual(self.security_events, [])
+
+    def test_failed_sign_in_matches_email_to_account_id_without_claiming_actor_identity(self):
+        status_code, payload = self.request(
+            "/api/security/report-login-failure",
+            method="POST",
+            payload={"email": "User@Example.com"},
+        )
+
+        self.assertEqual(status_code, 202)
+        self.assertTrue(payload["recorded"])
+        event = self.security_events[0]
+        self.assertEqual(event["event_type"], "client_reported_sign_in_failure")
+        self.assertEqual(event["account_email"], "user@example.com")
+        self.assertEqual(event["account_id"], TEST_SENDER_ID)
 
     def test_invalid_room_code_logs_ip_and_verified_account_identity(self):
         token = self.sign_in()

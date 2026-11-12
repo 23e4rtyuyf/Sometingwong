@@ -19,6 +19,11 @@ To include raw client IPs and account identifiers in the admin log, also run
 `supabase/migrations/20261112000200_chat_api_security_event_identifiers.sql`
 after the first security-events migration and before deploying the updated
 function.
+To resolve failed sign-in email reports to an account ID when the email matches
+an existing account, run
+`supabase/migrations/20261112000300_chat_api_account_identity_lookup.sql`
+before deploying the updated function. The lookup RPC is executable only by
+`service_role`; it does not expose account lookup to browser clients.
 
 These migrations add private tables without changing or deleting the existing
 `messages` table. The new tables deny access to `anon` and `authenticated`;

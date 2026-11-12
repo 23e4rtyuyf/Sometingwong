@@ -182,7 +182,7 @@
         <p>By accessing or using the Private Messages application (the “Platform”), you agree to these Terms of Service. If you do not agree, do not use the Platform.</p>
         <h2>2. Privacy and data security</h2>
         <p>The Platform encrypts message contents on your device before they are sent to the database. Schools, school districts, educational institutions, and their administrators and employees are expressly prohibited from using the Platform or attempting to access, monitor, intercept, or decrypt any account or message. They may not direct, assist, or authorize another person to do so. They may not pressure, threaten, or retaliate against a student to obtain private messages, credentials, room codes, or account access, or punish a student solely for using the Platform or refusing to disclose private communications. All such conduct is expressly unauthorized by the Platform. Attempts by any person to bypass encryption or access an account without its owner’s consent are also prohibited by these Terms.</p>
-        <p><strong>Security activity logging:</strong> To detect misuse and investigate technical issues, the Platform records selected API security events. Entries may include the event type, time, HTTP method, API path, response status, raw client IP address, and authenticated account ID and email. Failed sign-in entries may include the email submitted in the browser; those reports are not independently verified. Only approved administrators can view the in-app security log. The log does not contain account passwords, access passwords, authentication tokens, cookies, encryption keys, message contents, or message ciphertext. Records older than 30 days are pruned during sign-in or administrator log review. Hosting and authentication providers may separately process technical or account data under their own policies.</p>
+        <p><strong>Security activity logging:</strong> To detect misuse and investigate security incidents, the Platform records selected API security events. Entries may include the event type, time, HTTP method, API path, response status, raw client IP address, and account ID and email when available. For failed sign-ins, the Platform may compare the submitted email with account records and record the matching account email and ID. This identifies the account targeted by the attempt, not the person who made it; an unmatched submitted email is unverified. Only approved administrators can view the in-app security log. The log does not contain account passwords, access passwords, authentication tokens, cookies, encryption keys, message contents, or message ciphertext. Records older than 30 days are pruned during sign-in or administrator log review. Hosting and authentication providers may separately process technical or account data under their own policies.</p>
         <p>Encryption is not a guarantee against monitoring or disclosure. The Platform cannot prevent monitoring of your device, browser, account, or network; protect a compromised device; or control what a school or network operator does. Room codes, room names, nicknames, and message timing may be visible to the service.</p>
         <p>Where practicable and permitted by law, the Platform may restrict access in response to misuse or attempts to compromise user privacy. The Platform cannot guarantee that it can identify or block every third party.</p>
         <h2>3. Disclaimer of warranties</h2>
@@ -196,8 +196,8 @@
         <p>These Terms are governed by the laws of the State of California, without regard to its conflict-of-law provisions, subject to any laws that cannot be excluded.</p>
         <h2>7. Affirmative representation of eligibility</h2>
         <p>By accessing the Platform, you affirmatively represent and warrant that you are not acting on behalf of, or employed by, any public or private school, school district, or educational institution. Any misrepresentation of your status constitutes a material breach of these Terms and fraud in the inducement.</p>
-        <h2>8. Liquidated damages for prohibited institutional access</h2>
-        <p>You acknowledge that unauthorized access, monitoring, or use of the Platform by a school, school district, private educational institution, or its employees or agents may cause substantial harm to the Platform’s reputation, user trust, and security infrastructure that is difficult to quantify. For access or use in violation of the School Employees restriction, you agree to pay the Platform $2,500 per violation or unauthorized session as liquidated damages and a reasonable pre-estimate of harm, not as a penalty.</p>
+        <h2>8. Remedies for repeated unauthorized access</h2>
+        <p>Intentional, unauthorized access or attempted access to accounts, security logs, or Platform systems—including bypassing access controls, attempting account takeover, or monitoring or intercepting private communications—is prohibited. Where permitted by applicable law, and only for proven offenses, the Platform may seek liquidated damages of $2,500 for a first offense, $40,000 for a second offense, $100,000 for a third offense, and $1,000,000 for a fourth offense. An account match or IP address in a security log is evidence of a request or account targeted, not by itself proof of who made the request or that a particular person committed an offense. These amounts are not automatic charges and remain subject to applicable law and a court’s determination.</p>
         <h2>9. Attorney’s fees and enforcement costs</h2>
         <p>In any legal action, arbitration, or proceeding brought to enforce these Terms or recover damages for a breach, the prevailing party shall be entitled to recover its reasonable attorney’s fees, court costs, and investigative expenses from the non-prevailing party.</p>
         <h2>10. Equitable and injunctive relief</h2>
@@ -247,8 +247,8 @@
   </dialog>
   <dialog id="securityDialog" class="security-dialog" aria-labelledby="securityDialogTitle">
     <h2 id="securityDialogTitle">Security activity</h2>
-    <p class="small">Each entry shows request time, method, path, status, raw client IP, and account ID or email when available. Delete one entry at a time with its Delete log button. Passwords, tokens, and message contents are never shown.</p>
-    <p class="small">Failed sign-in reports include the email entered in the browser and may be inaccurate. Full Edge Function runtime logs are in Supabase Dashboard → Edge Functions → your function → Logs.</p>
+    <p class="small">Entries show request time, method, path, status, raw client IP, and account details when available. A failed sign-in may show the matched account targeted by the attempt; this does not identify who entered the credentials. Delete one entry at a time. Passwords, tokens, and message contents are never shown.</p>
+    <p class="small">Full Edge Function runtime logs are in Supabase Dashboard → Edge Functions → your function → Logs.</p>
     <p id="securityStatus" class="status" role="status" aria-live="polite"></p>
     <div id="securityEvents" class="security-events" aria-live="polite"></div>
     <div class="dialog-actions">
@@ -1670,19 +1670,17 @@ function renderSecurityEvents(events) {
     const account = document.createElement('p');
     account.className = 'small';
     const isReportedSignInFailure = event.type === 'client_reported_sign_in_failure';
-    account.textContent = `Account email: ${!isReportedSignInFailure && event.accountEmail
-      ? event.accountEmail
-      : 'unavailable'}`;
-    card.append(account);
-    if (isReportedSignInFailure && event.accountEmail) {
-      const reportedEmail = document.createElement('p');
-      reportedEmail.className = 'small';
-      reportedEmail.textContent = `Reported email (unverified): ${event.accountEmail}`;
-      card.append(reportedEmail);
+    if (isReportedSignInFailure) {
+      account.textContent = event.accountId
+        ? `Matched account email (attempt target): ${event.accountEmail || 'unavailable'}`
+        : `Reported email (unverified): ${event.accountEmail || 'unavailable'}`;
+    } else {
+      account.textContent = `Account email: ${event.accountEmail || 'unavailable'}`;
     }
+    card.append(account);
     const accountId = document.createElement('p');
     accountId.className = 'small';
-    accountId.textContent = `Account ID: ${event.accountId || 'unavailable'}`;
+    accountId.textContent = `${isReportedSignInFailure ? 'Matched account ID' : 'Account ID'}: ${event.accountId || 'unavailable'}`;
     card.append(accountId);
     if (event.sourceHash) {
       const source = document.createElement('p');

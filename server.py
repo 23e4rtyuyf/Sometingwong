@@ -534,12 +534,31 @@ class SiteHandler(BaseHTTPRequestHandler):
             },
         )
         if _allow_security_event(self, "client_reported_sign_in_failure"):
+            identity = {"account_email": email}
+            try:
+                matches = _supabase_request(
+                    "/rest/v1/rpc/lookup_chat_account_by_email",
+                    method="POST",
+                    body={"email_to_find": email},
+                )
+                if isinstance(matches, list) and matches:
+                    matched = matches[0]
+                    if isinstance(matched, dict):
+                        identity = {
+                            "account_id": matched.get("account_id"),
+                            "account_email": _security_email(
+                                matched.get("account_email")
+                            ) or email,
+                        }
+            except ApiError:
+                # Keep the failed-login event even if account matching is unavailable.
+                pass
             _write_security_event(
                 self,
                 "client_reported_sign_in_failure",
                 "/api/auth/sign-in",
                 401,
-                {"account_email": email},
+                identity,
             )
         self._send_json(202, {"ok": True, "recorded": True})
 
