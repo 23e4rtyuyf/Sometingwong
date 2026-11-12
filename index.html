@@ -231,6 +231,7 @@
   </div>
   <div id="rooms">
     <div id="chatList" class="chat-list" aria-live="polite"></div>
+    <p id="historySyncStatus" class="small" role="status" aria-live="polite" hidden></p>
     <div class="room-setup">
     <div class="card">
       <h2>Create a room</h2>
@@ -293,6 +294,7 @@
               <button id="editRoomName" type="button">Rename chat</button>
               <button id="copyRoomCode" type="button">Copy room code</button>
               <button id="refresh" type="button">Refresh messages</button>
+              <button id="deleteMyMessages" class="danger" type="button">Delete my messages everywhere</button>
               <button id="leave" type="button">Back to chats</button>
             </div>
           </details>
@@ -335,6 +337,7 @@ let renderedMessageIds = new Set();
 let locallyDeletedMessageIds = new Set();
 let messagesInitialized = false;
 let showingCachedHistory = false;
+let roomEntryGeneration = 0;
 let apiToken = '';
 let supabaseAccessToken = '';
 let accountDisplayName = '';
@@ -346,7 +349,9 @@ let activeRoomName = '';
 let termsAccepted = false;
 let savedProfile = {};
 let localHistorySaved = false;
-let historyBackfillRoom = '';
+const historySyncs = new Map();
+let allRoomHistorySync = null;
+let deletingAllMessages = false;
 let serverHasOlder = false;
 let olderMessagesLoading = false;
 let historyDbPromise = null;
@@ -451,16 +456,18 @@ async function saveAccountDisplayName(name) {
 async function refreshRoomList() {
   const result = await apiRequest('/api/rooms');
   const list = $('chatList');
+  const rooms = Array.isArray(result.rooms)
+    ? result.rooms.filter((room) => room && /^\d{6}$/.test(room.roomCode || ''))
+    : [];
   list.replaceChildren();
-  if (!Array.isArray(result.rooms) || result.rooms.length === 0) {
+  if (rooms.length === 0) {
     const empty = document.createElement('p');
     empty.className = 'chat-list-empty';
     empty.textContent = 'No chats yet. Create one or join with a room code.';
     list.append(empty);
-    return;
+    return rooms;
   }
-  for (const room of result.rooms) {
-    if (!room || !/^\d{6}$/.test(room.roomCode || '')) continue;
+  for (const room of rooms) {
     const button = document.createElement('button');
     button.type = 'button';
     const name = document.createElement('span');
@@ -473,6 +480,7 @@ async function refreshRoomList() {
     });
     list.append(button);
   }
+  return rooms;
 }
 function openHistoryDatabase() {
   if (!window.indexedDB) return Promise.reject(new Error('This browser does not support local chat history.'));
@@ -608,11 +616,12 @@ async function removeCachedMessagesNotIn(code, serverIds) {
     return false;
   }
 }
-async function pruneDeletedMessages(messages) {
+async function pruneDeletedMessages(messages, room) {
   const currentIds = new Set(messages.map((item) => String(item.id)));
   const newestPageBoundary = messages[0] || null;
   const removedIds = [];
   for (const row of $('messages').querySelectorAll('.message')) {
+    if (roomCode !== room) return removedIds.length > 0;
     const messageId = row.dataset.messageId;
     const messageTime = { id: messageId, created_at: row.dataset.createdAt };
     if ((!newestPageBoundary || compareMessages(messageTime, newestPageBoundary) >= 0)
@@ -623,7 +632,8 @@ async function pruneDeletedMessages(messages) {
     }
   }
   for (const messageId of removedIds) {
-    await deleteCachedMessage(roomCode, messageId);
+    if (roomCode !== room) return removedIds.length > 0;
+    await deleteCachedMessage(room, messageId);
   }
   return removedIds.length > 0;
 }
@@ -727,14 +737,16 @@ $('accessForm').addEventListener('submit', async (event) => {
     showPage('chat');
     $('rooms').classList.remove('hidden');
     $('chat').classList.add('hidden');
+    let availableRooms = [];
     try {
-      await refreshRoomList();
+      availableRooms = await refreshRoomList();
     } catch (error) {
       status(`Could not load your saved chats: ${error.message}`);
     }
     if (savedProfile.room && savedProfile.name) {
       await enterRoom(savedProfile.room, savedProfile.name);
     }
+    void syncAllRoomHistories(availableRooms).catch(() => {});
   } catch (error) {
     $('accountPassword').value = '';
     $('accessPassword').value = '';
@@ -807,8 +819,93 @@ async function deleteMessage(messageId, row, button) {
     status(error.message || 'Could not delete the message.');
   }
 }
+async function deleteMyMessagesEverywhere() {
+  if (!apiToken) {
+    status('Sign in again before deleting messages.');
+    return;
+  }
+  const confirmed = window.confirm(
+    'Delete all messages sent by your account in every chat? This removes them for everyone and cannot be undone. Older messages not linked to this account may not be included.',
+  );
+  if (!confirmed) return;
+
+  const button = $('deleteMyMessages');
+  let deleted = 0;
+  let cacheFailures = 0;
+  button.disabled = true;
+  try {
+    while (historySyncs.size || allRoomHistorySync) {
+      const pendingSyncs = [...historySyncs.values()];
+      if (allRoomHistorySync) pendingSyncs.push(allRoomHistorySync);
+      if (!pendingSyncs.length) break;
+      status('Finishing history sync before deleting…');
+      await Promise.allSettled(pendingSyncs);
+    }
+    deletingAllMessages = true;
+    const result = await apiRequest('/api/rooms');
+    const rooms = Array.isArray(result.rooms)
+      ? result.rooms.filter((room) => room && /^\d{6}$/.test(room.roomCode || ''))
+      : [];
+    for (const room of rooms) {
+      let cursor = null;
+      while (true) {
+        const pageResult = await apiRequest(messagePageUrl(room.roomCode, cursor));
+        const page = Array.isArray(pageResult.messages) ? pageResult.messages : [];
+        if (!page.length) break;
+        const oldestMessage = page[0];
+        for (const message of page) {
+          if (message.can_delete !== true) continue;
+          const id = String(message.id);
+          if (room.roomCode === roomCode) locallyDeletedMessageIds.add(id);
+          try {
+            await apiRequest('/api/messages/delete', {
+              method: 'POST',
+              body: JSON.stringify({ roomCode: room.roomCode, messageId: message.id }),
+            });
+          } catch (error) {
+            if (room.roomCode === roomCode) locallyDeletedMessageIds.delete(id);
+            throw error;
+          }
+          deleted += 1;
+          if (!(await deleteCachedMessage(room.roomCode, id))) cacheFailures += 1;
+          if (room.roomCode === roomCode) {
+            const row = Array.from($('messages').querySelectorAll('.message'))
+              .find((item) => item.dataset.messageId === id);
+            row?.remove();
+            renderedMessageIds.delete(id);
+          }
+          if (deleted % 10 === 0) status(`Deleting your messages… ${deleted} removed.`);
+        }
+        if (pageResult.hasMore !== true) break;
+        cursor = oldestMessage;
+      }
+    }
+    if (roomCode) {
+      await renderMessages([]);
+      await updateLoadOlderButton();
+    }
+    if (cacheFailures) {
+      status(`Deleted ${deleted} message${deleted === 1 ? '' : 's'} from the server, but could not clear ${cacheFailures} local entr${cacheFailures === 1 ? 'y' : 'ies'}.`);
+    } else {
+      status(deleted
+        ? `Deleted ${deleted} message${deleted === 1 ? '' : 's'} from all your chats.`
+        : 'No messages from this account were found.');
+    }
+  } catch (error) {
+    if (roomCode) {
+      await renderMessages([]);
+      await updateLoadOlderButton();
+    }
+    status(`Deleted ${deleted} message${deleted === 1 ? '' : 's'} before stopping. ${error.message || 'Reconnect and try again.'}`);
+  } finally {
+    deletingAllMessages = false;
+    button.disabled = false;
+    if (apiToken && roomCode) void syncRoomHistory(roomCode).catch(() => {});
+  }
+}
 async function renderMessages(data, options = {}) {
   const container = $('messages');
+  if (options.expectedRoom && roomCode !== options.expectedRoom) return 0;
   if (!data.length && renderedMessageIds.size === 0) {
     if (!container.querySelector('.empty-chat')) {
       const empty = document.createElement('div');
@@ -825,6 +922,7 @@ async function renderMessages(data, options = {}) {
   container.querySelector('.empty-chat')?.remove();
   let appended = 0;
   for (const item of data) {
+    if (options.expectedRoom && roomCode !== options.expectedRoom) return appended;
     const messageId = String(item.id);
     if (renderedMessageIds.has(messageId)) continue;
     renderedMessageIds.add(messageId);
@@ -841,6 +939,7 @@ async function renderMessages(data, options = {}) {
     } catch {
       output.textContent = 'Message unavailable.';
     }
+    if (options.expectedRoom && roomCode !== options.expectedRoom) return appended;
     row.append(meta, output);
     if (item.can_delete === true) {
       const actions = document.createElement('div');
@@ -858,13 +957,15 @@ async function renderMessages(data, options = {}) {
     else container.append(row);
     appended += 1;
   }
-  if (prepend && appended) container.scrollTop += container.scrollHeight - oldScrollHeight;
+  if (options.scrollToBottom === true) container.scrollTop = container.scrollHeight;
+  else if (prepend && appended) container.scrollTop += container.scrollHeight - oldScrollHeight;
   else if (appended && wasNearBottom) container.scrollTop = container.scrollHeight;
   return appended;
 }
 async function loadMessages() {
   const room = roomCode;
   const result = await apiRequest(messagePageUrl(room));
+  if (roomCode !== room) return false;
   const messages = result.messages.filter((item) => !locallyDeletedMessageIds.has(String(item.id)));
   const pageHasMore = result.hasMore === true;
   serverHasOlder = result.hasMore === true;
@@ -879,27 +980,20 @@ async function loadMessages() {
     showingCachedHistory = false;
   }
   const firstLoad = !messagesInitialized;
-  const hasRemovedMessages = await pruneDeletedMessages(messages);
+  const cachedBeforeLoad = firstLoad ? await readCachedMessages(room) : [];
+  if (roomCode !== room) return false;
+  const hasRemovedMessages = await pruneDeletedMessages(messages, room);
+  if (roomCode !== room) return false;
   const hasNewMessages = messages.some((item) => !renderedMessageIds.has(String(item.id)));
   if (!firstLoad && !hasNewMessages && !hasRemovedMessages) return false;
   localHistorySaved = await cacheEncryptedMessages(room, messages);
-  await renderMessages(messages);
+  if (roomCode !== room) return false;
+  await renderMessages(messages, { scrollToBottom: firstLoad, expectedRoom: room });
+  if (roomCode !== room) return false;
   messagesInitialized = true;
   await updateLoadOlderButton();
-  if (pageHasMore && historyBackfillRoom !== room) {
-    historyBackfillRoom = room;
-    void backfillOlderHistory(room, messages).catch(() => {});
-  } else if (!pageHasMore && firstLoad) {
-    if (!(await removeCachedMessagesNotIn(
-      room,
-      new Set(messages.map((item) => String(item.id))),
-    ))) {
-      localHistorySaved = false;
-    }
-    try { localStorage.setItem(`${HISTORY_COMPLETE_PREFIX}${room}`, 'true'); } catch { /* IndexedDB still retains the messages. */ }
-    $('historyStatus').textContent = localHistorySaved
-      ? 'All encrypted chat history is saved on this device.'
-      : 'This browser could not save chat history locally.';
+  if (firstLoad) {
+    void syncRoomHistory(room, { messages, hasMore: pageHasMore }, cachedBeforeLoad).catch(() => {});
   }
   return !firstLoad && hasNewMessages;
 }
@@ -911,57 +1005,133 @@ function messagePageUrl(room, cursor = null) {
   }
   return `/api/messages?${params.toString()}`;
 }
-async function backfillOlderHistory(room, firstPage) {
+function historyIsComplete(room) {
   try {
-    const cached = await readCachedMessages(room);
-    if (roomCode !== room || !firstPage.length) return;
-    let wasComplete = false;
-    try { wasComplete = cached.length > 0 && localStorage.getItem(`${HISTORY_COMPLETE_PREFIX}${room}`) === 'true'; }
-    catch { wasComplete = false; }
-    const serverIds = new Set(firstPage.map((item) => String(item.id)));
-    let cursor = firstPage[0];
-    const knownNewest = wasComplete ? cached[cached.length - 1] : null;
-    let more = serverHasOlder && (!knownNewest || compareMessages(cursor, knownNewest) > 0);
-    $('historyStatus').textContent = 'Saving older messages on this device…';
-    while (roomCode === room && more) {
-      const result = await apiRequest(messagePageUrl(room, cursor));
-      const page = Array.isArray(result.messages) ? result.messages : [];
-      if (!page.length) {
-        more = false;
-        break;
+    return localStorage.getItem(`${HISTORY_COMPLETE_PREFIX}${room}`) === 'true';
+  } catch {
+    return false;
+  }
+}
+function markHistoryComplete(room) {
+  try { localStorage.setItem(`${HISTORY_COMPLETE_PREFIX}${room}`, 'true'); }
+  catch { /* IndexedDB still retains the messages. */ }
+}
+async function syncRoomHistory(room, initialResult = null, previousCache = null) {
+  if (deletingAllMessages) return false;
+  if (historySyncs.has(room)) return historySyncs.get(room);
+  const job = (async () => {
+    try {
+      const result = initialResult || await apiRequest(messagePageUrl(room));
+      const firstPage = Array.isArray(result.messages) ? result.messages : [];
+      const cachedBeforeLoad = previousCache || await readCachedMessages(room);
+      const wasComplete = cachedBeforeLoad.length > 0 && historyIsComplete(room);
+      const knownNewest = wasComplete ? cachedBeforeLoad[cachedBeforeLoad.length - 1] : null;
+      if (!(await cacheEncryptedMessages(room, firstPage))) {
+        throw new Error('Could not save chat history on this device.');
       }
-      const nextCursor = page[0];
-      if (compareMessages(nextCursor, cursor) >= 0) {
-        more = false;
-        break;
+      const serverIds = new Set(firstPage.map((item) => String(item.id)));
+      const newestAtStart = firstPage[firstPage.length - 1] || null;
+      let more = result.hasMore === true
+        && (!wasComplete || Boolean(knownNewest && firstPage[0]
+          && compareMessages(firstPage[0], knownNewest) > 0));
+
+      if (roomCode === room) {
+        $('historyStatus').textContent = (more || result.hasMore === true)
+          ? 'Saving older messages on this device…'
+          : 'All encrypted chat history is saved on this device.';
       }
-      if (!(await cacheEncryptedMessages(room, page))) {
-        throw new Error('Could not save all chat history on this device.');
+
+      if (more && firstPage.length) {
+        let cursor = firstPage[0];
+        while (more) {
+          const pageResult = await apiRequest(messagePageUrl(room, cursor));
+          const page = Array.isArray(pageResult.messages) ? pageResult.messages : [];
+          if (!page.length) {
+            more = false;
+            break;
+          }
+          const nextCursor = page[0];
+          if (compareMessages(nextCursor, cursor) >= 0) {
+            throw new Error('Chat history did not advance to older messages.');
+          }
+          if (!(await cacheEncryptedMessages(room, page))) {
+            throw new Error('Could not save all chat history on this device.');
+          }
+          for (const item of page) serverIds.add(String(item.id));
+          cursor = nextCursor;
+          more = pageResult.hasMore === true;
+          if (wasComplete && knownNewest && compareMessages(nextCursor, knownNewest) <= 0) {
+            more = false;
+          }
+        }
       }
-      for (const item of page) serverIds.add(String(item.id));
-      cursor = nextCursor;
-      more = result.hasMore === true;
-      serverHasOlder = more;
-      if (knownNewest && compareMessages(nextCursor, knownNewest) <= 0) {
-        more = false;
+
+      if (!wasComplete) {
+        const latestCache = await readCachedMessages(room);
+        for (const item of latestCache) {
+          if (newestAtStart && compareMessages(item, newestAtStart) > 0) {
+            serverIds.add(String(item.id));
+          }
+        }
+        if (!(await removeCachedMessagesNotIn(room, serverIds))) {
+          throw new Error('Could not reconcile saved chat history on this device.');
+        }
+      }
+      markHistoryComplete(room);
+      if (roomCode === room) {
+        serverHasOlder = false;
+        $('historyStatus').textContent = 'All encrypted chat history is saved on this device.';
+        await updateLoadOlderButton();
+      }
+      return true;
+    } catch (error) {
+      if (roomCode === room) {
+        $('historyStatus').textContent = 'Some chat history could not be saved. Reconnect to continue.';
+        status(error.message || 'Could not save chat history.');
+      }
+      throw error;
+    }
+  })();
+  historySyncs.set(room, job);
+  try {
+    return await job;
+  } finally {
+    if (historySyncs.get(room) === job) historySyncs.delete(room);
+  }
+}
+async function syncAllRoomHistories(rooms) {
+  if (allRoomHistorySync) return allRoomHistorySync;
+  allRoomHistorySync = (async () => {
+    const validRooms = Array.isArray(rooms)
+      ? rooms.filter((room) => room && /^\d{6}$/.test(room.roomCode || ''))
+      : [];
+    if (!validRooms.length) {
+      $('historySyncStatus').textContent = '';
+      $('historySyncStatus').hidden = true;
+      return;
+    }
+    $('historySyncStatus').hidden = false;
+    let failed = 0;
+    for (let index = 0; index < validRooms.length; index += 1) {
+      if (!apiToken) return;
+      const room = validRooms[index];
+      $('historySyncStatus').textContent =
+        `Saving chat history on this device (${index + 1} of ${validRooms.length})…`;
+      try {
+        await syncRoomHistory(room.roomCode);
+      } catch {
+        failed += 1;
       }
     }
-    if (roomCode === room) {
-      if (!wasComplete && !(await removeCachedMessagesNotIn(room, serverIds))) {
-        throw new Error('Could not reconcile saved chat history on this device.');
-      }
-      serverHasOlder = false;
-      try { localStorage.setItem(`${HISTORY_COMPLETE_PREFIX}${room}`, 'true'); } catch { /* IndexedDB still retains the messages. */ }
-      $('historyStatus').textContent = 'All encrypted chat history is saved on this device.';
-      await updateLoadOlderButton();
-      historyBackfillRoom = '';
-    }
-  } catch (error) {
-    if (roomCode === room) {
-      historyBackfillRoom = '';
-      $('historyStatus').textContent = 'Some older messages could not be saved. Reconnect to continue.';
-      status(error.message || 'Could not save older chat messages.');
-    }
+    if (!apiToken) return;
+    $('historySyncStatus').textContent = failed
+      ? `Could not save history for ${failed} chat${failed === 1 ? '' : 's'}. Reopen those chats while connected to retry.`
+      : `All encrypted chat history is saved on this device for ${validRooms.length} chat${validRooms.length === 1 ? '' : 's'}.`;
+  })();
+  try {
+    return await allRoomHistorySync;
+  } finally {
+    allRoomHistorySync = null;
   }
 }
 async function updateLoadOlderButton() {
@@ -994,7 +1164,7 @@ async function loadOlderMessages() {
     const index = cached.findIndex((item) => String(item.id) === firstRow.dataset.messageId);
     if (index > 0) {
       const start = Math.max(0, index - HISTORY_UI_PAGE_SIZE);
-      await renderMessages(cached.slice(start, index), { prepend: true });
+      await renderMessages(cached.slice(start, index), { prepend: true, expectedRoom: room });
     } else if (serverHasOlder) {
       const cursor = { id: firstRow.dataset.messageId, created_at: firstRow.dataset.createdAt };
       const result = await apiRequest(messagePageUrl(room, cursor));
@@ -1004,7 +1174,8 @@ async function loadOlderMessages() {
       if (!(await cacheEncryptedMessages(room, older))) {
         status('Could not save the older messages on this device.');
       }
-      await renderMessages(older, { prepend: true });
+      if (roomCode !== room) return;
+      await renderMessages(older, { prepend: true, expectedRoom: room });
     }
     await updateLoadOlderButton();
   } catch (error) {
@@ -1040,22 +1211,24 @@ async function enterRoom(code, name) {
     status('Enter a 6-digit room code and your name.');
     return;
   }
+  const entryGeneration = ++roomEntryGeneration;
   try {
     await saveAccountDisplayName(requestedName);
     $('profileSyncStatus').textContent = 'Your name is synced to your account.';
   } catch (error) {
     $('profileSyncStatus').textContent = error.message;
   }
+  if (entryGeneration !== roomEntryGeneration) return;
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
   renderedMessageIds.clear();
   locallyDeletedMessageIds.clear();
   messagesInitialized = false;
   showingCachedHistory = false;
-  historyBackfillRoom = '';
   serverHasOlder = false;
   $('loadOlder').hidden = true;
   $('messages').replaceChildren();
+  $('messages').scrollTop = 0;
   localHistorySaved = false;
   let roomInfo;
   let offline = false;
@@ -1065,7 +1238,9 @@ async function enterRoom(code, name) {
       body: JSON.stringify({ roomCode: requestedCode })
     });
   } catch (error) {
+    if (entryGeneration !== roomEntryGeneration) return;
     const cached = await readCachedMessages(requestedCode);
+    if (entryGeneration !== roomEntryGeneration) return;
     if (!cached.length) {
       status(error.message || 'Could not join this chat.');
       return;
@@ -1082,14 +1257,16 @@ async function enterRoom(code, name) {
   } catch (error) {
     status(`Chat opened, but the chat list could not refresh: ${error.message}`);
   }
+  if (entryGeneration !== roomEntryGeneration) return;
   $('roomCode').textContent = `Code ${roomCode}`;
   $('identity').textContent = `You are ${nickname}`;
   updateRoomHeading();
   showPage('chat');
   if (offline) {
     const cached = await readCachedMessages(roomCode);
+    if (entryGeneration !== roomEntryGeneration) return;
     localHistorySaved = true;
-    await renderMessages(cached.slice(-MAX_DISPLAYED_MESSAGES));
+    await renderMessages(cached.slice(-MAX_DISPLAYED_MESSAGES), { scrollToBottom: true, expectedRoom: roomCode });
     showingCachedHistory = true;
     $('historyStatus').textContent = 'Showing encrypted messages saved on this device.';
     await updateLoadOlderButton();
@@ -1098,15 +1275,18 @@ async function enterRoom(code, name) {
   }
   try {
     await loadMessages();
+    if (entryGeneration !== roomEntryGeneration) return;
     subscribe();
   } catch (error) {
+    if (entryGeneration !== roomEntryGeneration) return;
     const cached = await readCachedMessages(roomCode);
+    if (entryGeneration !== roomEntryGeneration) return;
     if (!cached.length) {
       status(error.message);
       return;
     }
     localHistorySaved = true;
-    await renderMessages(cached.slice(-MAX_DISPLAYED_MESSAGES));
+    await renderMessages(cached.slice(-MAX_DISPLAYED_MESSAGES), { scrollToBottom: true, expectedRoom: roomCode });
     showingCachedHistory = true;
     $('historyStatus').textContent = 'Showing encrypted messages saved on this device.';
     await updateLoadOlderButton();
@@ -1174,6 +1354,10 @@ $('accountForm').addEventListener('submit', async (event) => {
   }
 });
 $('loadOlder').addEventListener('click', loadOlderMessages);
+$('deleteMyMessages').addEventListener('click', () => {
+  $('deleteMyMessages').closest('details').open = false;
+  void deleteMyMessagesEverywhere();
+});
 $('editRoomName').addEventListener('click', () => {
   $('roomNameInput').value = activeRoomName;
   $('roomNameStatus').textContent = '';
@@ -1276,8 +1460,9 @@ $('plain').addEventListener('keydown', (event) => {
 });
 $('refresh').addEventListener('click', async () => { try { await loadMessages(); status('Refreshed.'); } catch (error) { status(error.message); } });
 $('leave').addEventListener('click', () => {
+  roomEntryGeneration += 1;
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = null; renderedMessageIds.clear(); locallyDeletedMessageIds.clear(); messagesInitialized = false; showingCachedHistory = false; historyBackfillRoom = ''; serverHasOlder = false; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren(); $('loadOlder').hidden = true;
+  pollTimer = null; renderedMessageIds.clear(); locallyDeletedMessageIds.clear(); messagesInitialized = false; showingCachedHistory = false; serverHasOlder = false; roomCode = ''; nickname = ''; activeRoomName = ''; $('messages').replaceChildren(); $('messages').scrollTop = 0; $('loadOlder').hidden = true;
   $('roomTitle').textContent = '';
   $('roomCode').textContent = '';
   savedProfile.room = '';
