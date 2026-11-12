@@ -23,6 +23,7 @@ SUPABASE_ANON_KEY = "sb_publishable_LtMNYpBNgyymafFWbaRacg_6_vIgkcM"
 SESSION_TTL = 8 * 60 * 60
 MAX_BODY_BYTES = 32_000
 MAX_MESSAGES = 500
+MAX_UNREAD_COUNT = 100
 ROOM_JOIN_FAILURE_WINDOW = 15 * 60
 MAX_ROOM_JOIN_FAILURES = 8
 MAX_SIGN_IN_FAILURE_REPORTS = 5
@@ -163,6 +164,8 @@ def _is_chat_admin(user):
 def _security_event_type(path, status):
     if path == "/api/rooms/join" and status == 404:
         return "invalid_room_code"
+    if path == "/api/admin/security-events/delete" and status == 404:
+        return ""
     if status == 401:
         return "unauthorized_request"
     if status == 403:
@@ -396,6 +399,9 @@ class SiteHandler(BaseHTTPRequestHandler):
             if path.path == "/api/admin/security-events":
                 self._list_security_events()
                 return
+            if path.path == "/api/messages/unread":
+                self._unread_messages(parse_qs(path.query))
+                return
             if path.path == "/api/messages":
                 self._read_messages(parse_qs(path.query))
                 return
@@ -428,6 +434,9 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/admin/accounts":
                 self._create_account()
+                return
+            if path == "/api/admin/security-events/delete":
+                self._delete_security_event()
                 return
             if path == "/api/messages":
                 self._insert_message()
@@ -565,6 +574,23 @@ class SiteHandler(BaseHTTPRequestHandler):
                 "sourceHash": source_hash[:12] if isinstance(source_hash, str) else "",
             })
         self._send_json(200, {"events": events})
+
+    def _delete_security_event(self):
+        self._require_admin_session()
+        body = self._read_body()
+        event_id = body.get("eventId")
+        if (set(body) != {"eventId"} or not isinstance(event_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", event_id)):
+            raise ApiError(400, "Select a valid security log entry.")
+        deleted = _supabase_request(
+            "/rest/v1/chat_api_security_events",
+            method="DELETE",
+            query={"event_id": f"eq.{event_id}"},
+            prefer="return=representation",
+        )
+        if not isinstance(deleted, list) or not deleted:
+            raise ApiError(404, "That security log entry was not found.")
+        self._send_json(200, {"ok": True})
 
     def _logout(self):
         token = self.headers.get("Authorization", "").partition(" ")[2]
@@ -787,6 +813,64 @@ class SiteHandler(BaseHTTPRequestHandler):
             "roomName": room_info["room_name"] if room_info else f"Room {room}",
             "hasMore": has_more,
         })
+
+    def _unread_messages(self, query):
+        session = self._require_session()
+        room_values = query.get("room", [])
+        room = room_values[0] if len(room_values) == 1 else ""
+        after_times = query.get("afterCreatedAt", [])
+        after_ids = query.get("afterId", [])
+        after_created_at = after_times[0] if len(after_times) == 1 else ""
+        after_id = after_ids[0] if len(after_ids) == 1 else ""
+        if not ROOM_RE.fullmatch(room):
+            raise ApiError(400, "Enter a valid 6-digit room code.")
+        if (len(after_times) > 1 or len(after_ids) > 1
+            or (after_ids and not after_created_at)
+            or (after_created_at and (
+                len(after_created_at) > 40
+                or not CURSOR_TIMESTAMP_RE.fullmatch(after_created_at)
+                or (after_id and not MESSAGE_ID_RE.fullmatch(after_id))
+            ))):
+            raise ApiError(400, "Invalid unread-message cursor.")
+        self._require_room_membership(session, room)
+        if not after_created_at:
+            latest = _supabase_request("/rest/v1/messages", query={
+                "select": "id,created_at",
+                "receiver_email": f"eq.{room}",
+                "order": "created_at.desc,id.desc",
+                "limit": "1",
+            })
+            if not isinstance(latest, list):
+                raise ApiError(502, "Chat storage returned an invalid response.")
+            latest_message = None
+            if latest and isinstance(latest[0], dict):
+                latest_message = {
+                    "id": latest[0].get("id"),
+                    "created_at": latest[0].get("created_at"),
+                }
+            return self._send_json(200, {
+                "unreadCount": 0,
+                "latestMessage": latest_message,
+                "baselineAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            })
+        message_query = {
+            "select": "id",
+            "receiver_email": f"eq.{room}",
+            "sender_id": f"neq.{session['sender_id']}",
+            "order": "created_at.desc,id.desc",
+            "limit": str(MAX_UNREAD_COUNT),
+        }
+        if after_id:
+            message_query["or"] = (
+                f"(created_at.gt.{after_created_at},"
+                f"and(created_at.eq.{after_created_at},id.gt.{after_id}))"
+            )
+        else:
+            message_query["created_at"] = f"gt.{after_created_at}"
+        unread = _supabase_request("/rest/v1/messages", query=message_query)
+        if not isinstance(unread, list):
+            raise ApiError(502, "Chat storage returned an invalid unread-message count.")
+        self._send_json(200, {"unreadCount": min(len(unread), MAX_UNREAD_COUNT)})
 
     def _insert_message(self):
         session = self._require_session()

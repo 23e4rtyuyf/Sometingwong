@@ -84,7 +84,12 @@ class ServerApiTests(unittest.TestCase):
                 self.security_events.append(row)
                 return None
             if method == "DELETE":
-                return None
+                event_id = query.get("event_id", "").removeprefix("eq.")
+                deleted = [row for row in self.security_events if row.get("event_id") == event_id]
+                self.security_events[:] = [
+                    row for row in self.security_events if row.get("event_id") != event_id
+                ]
+                return deleted
         if table == "chat_api_failed_logins":
             if method == "GET":
                 address_hash = query.get("address_hash", "").removeprefix("eq.")
@@ -131,14 +136,23 @@ class ServerApiTests(unittest.TestCase):
                 self.members.add((body["room_code"], body["sender_id"]))
                 return None
         if table == "messages":
-            if method == "GET" and query.get("select") == "id":
+            if (method == "GET" and query.get("select") == "id"
+                and "sender_id" not in query and "order" not in query):
                 return []
             if method == "GET":
                 message_room = query.get("receiver_email", "").removeprefix("eq.")
-                rows = sorted([
+                rows = [
                     dict(message) for message in self.messages
                     if message.get("receiver_email") == message_room
-                ], key=lambda message: (message["created_at"], str(message["id"])), reverse=True)
+                ]
+                sender_filter = query.get("sender_id", "")
+                if sender_filter.startswith("neq."):
+                    excluded_sender = sender_filter.removeprefix("neq.")
+                    rows = [message for message in rows if message.get("sender_id") != excluded_sender]
+                created_after = query.get("created_at", "")
+                if created_after.startswith("gt."):
+                    cutoff = created_after.removeprefix("gt.")
+                    rows = [message for message in rows if message["created_at"] > cutoff]
                 cursor = query.get("or", "")
                 if cursor:
                     match = re.fullmatch(
@@ -153,6 +167,22 @@ class ServerApiTests(unittest.TestCase):
                             or (message["created_at"] == before_time
                                 and str(message["id"]) < before_id)
                         ]
+                    after_match = re.fullmatch(
+                        r"\(created_at\.gt\.(.*?),and\(created_at\.eq\.(.*?),id\.gt\.(.*?)\)\)",
+                        cursor,
+                    )
+                    if after_match:
+                        after_time, _, after_id = after_match.groups()
+                        rows = [
+                            message for message in rows
+                            if message["created_at"] > after_time
+                            or (message["created_at"] == after_time
+                                and str(message["id"]) > after_id)
+                        ]
+                rows.sort(
+                    key=lambda message: (message["created_at"], str(message["id"])),
+                    reverse="desc" in query.get("order", "created_at.desc,id.desc"),
+                )
                 return rows[:int(query.get("limit", server.MAX_MESSAGES))]
             if method == "POST":
                 self.saved_message = body
@@ -341,6 +371,128 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(payload["events"][0]["accountId"], TEST_SENDER_ID)
         self.assertEqual(payload["events"][0]["accountEmail"], "admin@example.com")
         self.assertNotIn("address_hash", payload["events"][0])
+
+    def test_security_event_can_be_deleted_individually_only_by_admin(self):
+        self.security_events.append({
+            "event_id": "event-1",
+            "created_at": "2026-11-12T12:00:00Z",
+            "event_type": "forbidden_request",
+            "request_method": "POST",
+            "request_path": "/api/admin/accounts",
+            "status_code": 403,
+            "address_hash": "a" * 64,
+        })
+        non_admin_token = self.sign_in()
+        status_code, _ = self.request(
+            "/api/admin/security-events/delete",
+            method="POST",
+            token=non_admin_token,
+            payload={"eventId": "event-1"},
+        )
+        self.assertEqual(status_code, 403)
+        self.assertIn("event-1", [
+            row["event_id"] for row in self.security_events if "event_id" in row
+        ])
+
+        self.auth_user.return_value = {
+            "id": TEST_SENDER_ID,
+            "email": "admin@example.com",
+        }
+        admin_token = self.sign_in()
+        status_code, response = self.request(
+            "/api/admin/security-events/delete",
+            method="POST",
+            token=admin_token,
+            payload={"eventId": "event-1"},
+        )
+        self.assertEqual(status_code, 200)
+        self.assertTrue(response["ok"])
+        self.assertNotIn("event-1", [
+            row["event_id"] for row in self.security_events if "event_id" in row
+        ])
+
+    def test_unread_count_is_room_scoped_and_excludes_my_messages(self):
+        token = self.sign_in()
+        self.join_room(token)
+        status_code, baseline = self.request(
+            "/api/messages/unread?room=123456",
+            token=token,
+        )
+        self.assertEqual(status_code, 200)
+        self.assertEqual(baseline["unreadCount"], 0)
+        cursor = baseline["latestMessage"]
+        self.assertNotIn("encrypted_text", cursor)
+        self.assertNotIn("sender_id", cursor)
+        self.messages.extend([
+            {
+                "id": 2,
+                "created_at": "2026-11-10T12:01:00Z",
+                "sender_email": "Other",
+                "receiver_email": "123456",
+                "sender_id": "another-account",
+                "encrypted_text": "PM3." + "B" * 45,
+            },
+            {
+                "id": 3,
+                "created_at": "2026-11-10T12:02:00Z",
+                "sender_email": "Test",
+                "receiver_email": "123456",
+                "sender_id": TEST_SENDER_ID,
+                "encrypted_text": "PM3." + "C" * 45,
+            },
+            {
+                "id": 4,
+                "created_at": "2026-11-10T12:03:00Z",
+                "sender_email": "Other",
+                "receiver_email": "123456",
+                "sender_id": "another-account",
+                "encrypted_text": "PM3." + "D" * 45,
+            },
+        ])
+
+        status_code, unread = self.request(
+            "/api/messages/unread?room=123456"
+            f"&afterCreatedAt={cursor['created_at']}&afterId={cursor['id']}",
+            token=token,
+        )
+        self.assertEqual(status_code, 200)
+        self.assertEqual(unread["unreadCount"], 2)
+        self.assertNotIn("messages", unread)
+        self.assertNotIn("encrypted_text", unread)
+
+    def test_unread_count_requires_room_membership(self):
+        token = self.sign_in()
+        status_code, _ = self.request(
+            "/api/messages/unread?room=123456",
+            token=token,
+        )
+        self.assertEqual(status_code, 403)
+
+    def test_first_message_in_empty_room_becomes_unread_after_baseline(self):
+        self.messages = []
+        token = self.sign_in()
+        self.join_room(token)
+        status_code, baseline = self.request(
+            "/api/messages/unread?room=123456",
+            token=token,
+        )
+        self.assertEqual(status_code, 200)
+        self.assertIsNone(baseline["latestMessage"])
+        self.messages.append({
+            "id": 1,
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "sender_email": "Other",
+            "receiver_email": "123456",
+            "sender_id": "another-account",
+            "encrypted_text": "PM3." + "E" * 45,
+        })
+        status_code, unread = self.request(
+            "/api/messages/unread?room=123456"
+            f"&afterCreatedAt={baseline['baselineAt']}",
+            token=token,
+        )
+        self.assertEqual(status_code, 200)
+        self.assertEqual(unread["unreadCount"], 1)
 
     def test_anonymous_supabase_user_cannot_create_an_app_session(self):
         self.auth_user_patch.stop()

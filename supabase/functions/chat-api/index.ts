@@ -9,6 +9,7 @@ const MAX_SIGN_IN_FAILURE_REPORTS = 5;
 const SECURITY_EVENT_RETENTION_DAYS = 30;
 const SECURITY_EVENT_LIST_LIMIT = 100;
 const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const CURSOR_TIMESTAMP_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/;
 const encoder = new TextEncoder();
 
 class ApiError extends Error {
@@ -601,6 +602,25 @@ async function listSecurityEvents(request) {
   };
 }
 
+async function deleteSecurityEvent(request) {
+  await requireChatAdmin(request);
+  const body = await readJson(request);
+  const eventId = typeof body.eventId === "string" ? body.eventId : "";
+  if (Object.keys(body).length !== 1 || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
+    throw new ApiError(400, "Select a valid security log entry.");
+  }
+  const deleted = await supabaseRequest("chat_api_security_events", {
+    event_id: `eq.${eventId}`,
+  }, {
+    method: "DELETE",
+    prefer: "return=representation",
+  });
+  if (!Array.isArray(deleted) || deleted.length === 0) {
+    throw new ApiError(404, "That security log entry was not found.");
+  }
+  return { ok: true };
+}
+
 function validatedRoomName(value) {
   const roomName = typeof value === "string" ? value.trim() : "";
   if (!/^[^\x00-\x1f\x7f]{1,40}$/.test(roomName)) {
@@ -842,6 +862,62 @@ async function readMessages(request) {
   };
 }
 
+async function unreadMessageCount(request) {
+  const session = await requireSession(request);
+  const url = new URL(request.url);
+  const rooms = url.searchParams.getAll("room");
+  const room = rooms.length === 1 ? rooms[0] : "";
+  const afterTimes = url.searchParams.getAll("afterCreatedAt");
+  const afterIds = url.searchParams.getAll("afterId");
+  const afterCreatedAt = afterTimes.length === 1 ? afterTimes[0] : "";
+  const afterId = afterIds.length === 1 ? afterIds[0] : "";
+  if (!/^[0-9]{6}$/.test(room)) {
+    throw new ApiError(400, "Enter a valid 6-digit room code.");
+  }
+  if (afterTimes.length > 1 || afterIds.length > 1
+    || (afterIds.length > 0 && !afterCreatedAt)
+    || (afterCreatedAt && (afterCreatedAt.length > 40
+      || !CURSOR_TIMESTAMP_RE.test(afterCreatedAt)
+      || !Number.isFinite(Date.parse(afterCreatedAt))
+      || (afterId && !MESSAGE_ID_RE.test(afterId))))) {
+    throw new ApiError(400, "Invalid unread-message cursor.");
+  }
+  await requireRoomMembership(room, session.sender_id);
+  if (!afterCreatedAt) {
+    const latest = await supabaseRequest("messages", {
+      select: "id,created_at",
+      receiver_email: `eq.${room}`,
+      order: "created_at.desc,id.desc",
+      limit: "1",
+    });
+    if (!Array.isArray(latest)) {
+      throw new ApiError(502, "Chat storage returned an invalid response.");
+    }
+    return {
+      unreadCount: 0,
+      latestMessage: latest[0] && typeof latest[0] === "object"
+        ? { id: latest[0].id, created_at: latest[0].created_at }
+        : null,
+      baselineAt: new Date().toISOString(),
+    };
+  }
+  const query = {
+    select: "id",
+    receiver_email: `eq.${room}`,
+    sender_id: `neq.${session.sender_id}`,
+    order: "created_at.desc,id.desc",
+    limit: "100",
+    ...(afterId
+      ? { or: `(created_at.gt.${afterCreatedAt},and(created_at.eq.${afterCreatedAt},id.gt.${afterId}))` }
+      : { created_at: `gt.${afterCreatedAt}` }),
+  };
+  const unread = await supabaseRequest("messages", query);
+  if (!Array.isArray(unread)) {
+    throw new ApiError(502, "Chat storage returned an invalid unread-message count.");
+  }
+  return { unreadCount: unread.length };
+}
+
 async function insertMessage(request) {
   const session = await requireSession(request);
   const body = await readJson(request);
@@ -935,6 +1011,9 @@ async function handle(request) {
     if (request.method === "GET" && route === "/api/admin/security-events") {
       return jsonResponse(request, 200, await listSecurityEvents(request));
     }
+    if (request.method === "POST" && route === "/api/admin/security-events/delete") {
+      return jsonResponse(request, 200, await deleteSecurityEvent(request));
+    }
     if (request.method === "POST" && route === "/api/rooms") {
       return jsonResponse(request, 201, await createRoom(request));
     }
@@ -952,6 +1031,9 @@ async function handle(request) {
     }
     if (request.method === "GET" && route === "/api/messages") {
       return jsonResponse(request, 200, await readMessages(request));
+    }
+    if (request.method === "GET" && route === "/api/messages/unread") {
+      return jsonResponse(request, 200, await unreadMessageCount(request));
     }
     if (request.method === "POST" && route === "/api/messages") {
       await insertMessage(request);

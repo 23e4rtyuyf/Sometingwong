@@ -96,6 +96,10 @@ The new IP and account columns remain protected by the existing service-role-onl
 table permissions and the admin-only endpoint.
 Supabase's full Edge Function runtime logs remain available in the Dashboard
 under **Edge Functions → Functions → your function → Logs**.
+Individual event deletion uses the same admin-only endpoint and existing
+service-role table permissions. Unread badges count messages without returning
+their contents and save each account's read cursor on the current device. These
+features do not require another SQL migration.
 
 `api-config.js` uses the function base URL and public Supabase publishable key.
 Never put the service-role key in browser code. The browser client sends the

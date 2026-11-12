@@ -49,7 +49,11 @@
     .chat-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:.65rem; max-width:850px; margin:0 0 1rem; }
     .chat-list button { display:flex; align-items:center; justify-content:space-between; gap:.7rem; width:100%; margin:0; padding:.8rem 1rem; background:#fff; color:var(--ink); text-align:left; border:1px solid var(--line); box-shadow:0 2px 8px #23416a08; }
     .chat-list button:hover { background:#f7faff; border-color:#a8bee0; }
+    .chat-list-main { min-width:0; display:grid; gap:.15rem; }
+    .chat-list-main span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .chat-list small { color:var(--muted); font-weight:400; }
+    .unread-badge { display:grid; place-items:center; flex:0 0 auto; min-width:1.45rem; height:1.45rem; padding:0 .35rem; border-radius:999px; background:#dc2626; color:#fff !important; font-size:.75rem; font-weight:700 !important; line-height:1; }
+    .unread-badge[hidden] { display:none; }
     .chat-list-empty { grid-column:1/-1; margin:0; padding:.85rem 1rem; color:var(--muted); border:1px dashed var(--line); border-radius:12px; }
     .card { border:1px solid var(--line); border-radius:15px; padding:1.25rem; background:#fff; box-shadow:0 4px 18px #23416a08; }
     .card h2 { margin:0 0 .25rem; font-size:1.12rem; }
@@ -103,8 +107,11 @@
     .security-dialog { width:min(740px,calc(100% - 2rem)); max-height:calc(100% - 2rem); }
     .security-events { display:grid; gap:.55rem; max-height:48vh; overflow-y:auto; margin:.75rem 0; }
     .security-event { padding:.75rem; border:1px solid var(--line); border-radius:10px; background:#f8fafd; }
-    .security-event-header { display:flex; justify-content:space-between; gap:.75rem; }
+    .security-event-header { display:flex; align-items:center; justify-content:space-between; gap:.75rem; }
+    .security-event-header strong { flex:1; }
     .security-event p { margin:.3rem 0 0; }
+    .security-event-delete { width:auto; margin:0; padding:.35rem .6rem; border:1px solid #efb8b8; background:#fff; color:#a11b1b; font-size:.8rem; }
+    .security-event-delete:hover { background:#fff1f1; }
     dialog { width:min(420px,calc(100% - 2rem)); border:1px solid var(--line); border-radius:15px; padding:1.25rem; color:var(--ink); background:#fff; box-shadow:0 20px 60px #0f172a40; }
     .terms-dialog { width:min(720px,calc(100% - 2rem)); max-height:calc(100% - 2rem); }
     dialog::backdrop { background:#0f172a99; }
@@ -263,7 +270,7 @@
     <button id="securityDashboard" class="secondary" type="button" hidden>Security log</button>
   </nav>
   </header>
-  <p class="small">Chat history is saved on this device after it syncs. The app does not store your account password or access password.</p>
+  <p class="small">Chat history is saved on this device, and unread status is tracked here. The app does not store your account password or access password.</p>
 
   <section id="chatPage">
   <div class="intro">
@@ -363,17 +370,25 @@ const ENCRYPTION_ITERATIONS = 600000;
 const PROFILE_KEY = 'private-chat-profile-v1';
 const MESSAGE_CACHE_PREFIX = 'private-chat-encrypted-history-v1:';
 const HISTORY_COMPLETE_PREFIX = 'private-chat-history-complete-v2:';
+const UNREAD_CURSOR_PREFIX = 'private-chat-read-cursors-v1:';
 const MAX_DISPLAYED_MESSAGES = 500;
 const HISTORY_DB_NAME = 'private-chat-history-v2';
 const HISTORY_STORE = 'messages';
 const HISTORY_UI_PAGE_SIZE = 100;
 const SERVER_PAGE_SIZE = 500;
+const MAX_UNREAD_COUNT = 100;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const $ = (id) => document.getElementById(id);
 let roomCode = '';
+let currentAccountId = '';
 let nickname = '';
 let pollTimer = null;
+let unreadPollTimer = null;
+let unreadPollBusy = false;
+let roomList = [];
+let roomReadCursors = {};
+let roomUnreadCounts = {};
 let renderedMessageIds = new Set();
 let locallyDeletedMessageIds = new Set();
 let messagesInitialized = false;
@@ -403,6 +418,7 @@ function lockForExpiredSession() {
   if (!apiToken) return;
   apiToken = '';
   supabaseAccessToken = '';
+  currentAccountId = '';
   accountDisplayName = '';
   isAccountAdmin = false;
   $('manageAccounts').hidden = true;
@@ -413,6 +429,12 @@ function lockForExpiredSession() {
   accessPassword = '';
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
+  if (unreadPollTimer) clearInterval(unreadPollTimer);
+  unreadPollTimer = null;
+  unreadPollBusy = false;
+  roomList = [];
+  roomReadCursors = {};
+  roomUnreadCounts = {};
   $('accessGate').classList.remove('hidden');
   $('protectedApp').classList.add('hidden');
   $('accessStatus').textContent = 'Your session expired. Sign in again to continue.';
@@ -513,6 +535,7 @@ async function refreshRoomList() {
   const rooms = Array.isArray(result.rooms)
     ? result.rooms.filter((room) => room && /^\d{6}$/.test(room.roomCode || ''))
     : [];
+  roomList = rooms;
   list.replaceChildren();
   if (rooms.length === 0) {
     const empty = document.createElement('p');
@@ -524,16 +547,27 @@ async function refreshRoomList() {
   for (const room of rooms) {
     const button = document.createElement('button');
     button.type = 'button';
+    button.dataset.roomCode = room.roomCode;
+    const main = document.createElement('span');
+    main.className = 'chat-list-main';
     const name = document.createElement('span');
     name.textContent = room.roomName || `Room ${room.roomCode}`;
     const code = document.createElement('small');
     code.textContent = room.roomCode;
-    button.append(name, code);
+    main.append(name, code);
+    const badge = document.createElement('span');
+    badge.className = 'unread-badge';
+    const count = Math.max(0, Number(roomUnreadCounts[room.roomCode]) || 0);
+    badge.hidden = count === 0;
+    badge.textContent = count >= MAX_UNREAD_COUNT ? '99+' : String(count);
+    badge.setAttribute('aria-label', `${count} unread message${count === 1 ? '' : 's'}`);
+    button.append(main, badge);
     button.addEventListener('click', () => {
       enterRoom(room.roomCode, $('profileName').value);
     });
     list.append(button);
   }
+  updateRoomUnreadBadges();
   return rooms;
 }
 function openHistoryDatabase() {
@@ -712,6 +746,116 @@ function saveProfile() {
   savedProfile = profile;
   $('profileName').value = nickname;
 }
+function unreadCursorStorageKey(accountId = currentAccountId) {
+  return accountId ? `${UNREAD_CURSOR_PREFIX}${accountId}` : '';
+}
+function loadRoomReadCursors(accountId) {
+  if (!accountId) return {};
+  try {
+    const parsed = JSON.parse(localStorage.getItem(unreadCursorStorageKey(accountId)) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([room, cursor]) =>
+      /^\d{6}$/.test(room)
+      && cursor
+      && typeof cursor.created_at === 'string'
+      && cursor.created_at.length <= 40
+      && Number.isFinite(Date.parse(cursor.created_at))
+      && (cursor.id == null || /^[A-Za-z0-9_-]{1,64}$/.test(String(cursor.id))),
+    ).map(([room, cursor]) => [room, {
+      created_at: cursor.created_at,
+      id: cursor.id == null ? null : String(cursor.id),
+    }]));
+  } catch {
+    return {};
+  }
+}
+function saveRoomReadCursor(room, cursor) {
+  if (!currentAccountId || !/^\d{6}$/.test(room)
+    || !cursor || typeof cursor.created_at !== 'string'
+    || !Number.isFinite(Date.parse(cursor.created_at))) return;
+  const id = cursor.id == null ? null : String(cursor.id);
+  if (id != null && !/^[A-Za-z0-9_-]{1,64}$/.test(id)) return;
+  const current = roomReadCursors[room];
+  if (current && current.created_at === cursor.created_at && String(current.id || '') === String(id || '')) {
+    return;
+  }
+  roomReadCursors[room] = { created_at: cursor.created_at, id };
+  roomUnreadCounts[room] = 0;
+  try {
+    localStorage.setItem(unreadCursorStorageKey(), JSON.stringify(roomReadCursors));
+  } catch {
+    // Unread markers are a convenience; chat history remains available separately.
+  }
+  updateRoomUnreadBadges();
+}
+function updateRoomUnreadBadges() {
+  for (const button of $('chatList').querySelectorAll('button[data-room-code]')) {
+    const badge = button.querySelector('.unread-badge');
+    if (!badge) continue;
+    const count = Math.max(0, Number(roomUnreadCounts[button.dataset.roomCode]) || 0);
+    badge.hidden = count === 0;
+    badge.textContent = count >= MAX_UNREAD_COUNT ? '99+' : String(count);
+    badge.setAttribute('aria-label', `${count} unread message${count === 1 ? '' : 's'}`);
+    badge.title = `${count} unread message${count === 1 ? '' : 's'}`;
+  }
+}
+function canMarkCurrentRoomRead() {
+  if (!apiToken || !roomCode || document.visibilityState !== 'visible'
+    || $('chat').classList.contains('hidden')) return false;
+  const messages = $('messages');
+  return messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+}
+function markCurrentRoomReadFromDom() {
+  if (!canMarkCurrentRoomRead()) return;
+  const rows = $('messages').querySelectorAll('.message');
+  const latest = rows[rows.length - 1];
+  if (!latest) return;
+  saveRoomReadCursor(roomCode, {
+    id: latest.dataset.messageId,
+    created_at: latest.dataset.createdAt,
+  });
+}
+async function refreshUnreadCounts() {
+  if (!apiToken || !currentAccountId || unreadPollBusy || !roomList.length) return;
+  unreadPollBusy = true;
+  try {
+    for (const room of roomList) {
+      if (!apiToken) return;
+      const code = room.roomCode;
+      const cursor = roomReadCursors[code];
+      const params = new URLSearchParams({ room: code });
+      if (cursor?.created_at) {
+        params.set('afterCreatedAt', cursor.created_at);
+        if (cursor.id) params.set('afterId', cursor.id);
+      }
+      const result = await apiRequest(`/api/messages/unread?${params.toString()}`);
+      if (!cursor) {
+        const baseline = result.latestMessage || (result.baselineAt
+          ? { created_at: result.baselineAt, id: null }
+          : null);
+        if (baseline) saveRoomReadCursor(code, baseline);
+        roomUnreadCounts[code] = 0;
+      } else {
+        const count = Number(result.unreadCount);
+        roomUnreadCounts[code] = Number.isFinite(count)
+          ? Math.min(MAX_UNREAD_COUNT, Math.max(0, count))
+          : 0;
+      }
+    }
+  } catch {
+    // Keep the last known badge values when a background check cannot connect.
+  } finally {
+    unreadPollBusy = false;
+    updateRoomUnreadBadges();
+  }
+}
+function startUnreadPolling() {
+  if (unreadPollTimer) clearInterval(unreadPollTimer);
+  unreadPollTimer = null;
+  if (!apiToken || !currentAccountId) return;
+  void refreshUnreadCounts();
+  unreadPollTimer = setInterval(() => { void refreshUnreadCounts(); }, 5000);
+}
 $('showTerms').addEventListener('click', () => {
   termsAtBottom = false;
   $('acceptTerms').checked = false;
@@ -783,6 +927,9 @@ $('accessForm').addEventListener('submit', async (event) => {
     const startingName = accountName || (localNameBelongsToAccount ? savedProfile.name : '') || '';
     if (!localNameBelongsToAccount) savedProfile.room = '';
     savedProfile.accountId = account.user?.id || '';
+    currentAccountId = savedProfile.accountId;
+    roomReadCursors = loadRoomReadCursors(currentAccountId);
+    roomUnreadCounts = {};
     $('profileName').value = startingName;
     savedProfile.name = startingName;
     localStorage.setItem(PROFILE_KEY, JSON.stringify(savedProfile));
@@ -826,6 +973,7 @@ $('accessForm').addEventListener('submit', async (event) => {
       await enterRoom(savedProfile.room, savedProfile.name);
     }
     void syncAllRoomHistories(availableRooms).catch(() => {});
+    startUnreadPolling();
   } catch (error) {
     $('accountPassword').value = '';
     $('accessPassword').value = '';
@@ -1081,6 +1229,7 @@ async function loadMessages() {
   await renderMessages(messages, { scrollToBottom: firstLoad, expectedRoom: room });
   if (roomCode !== room) return false;
   messagesInitialized = true;
+  markCurrentRoomReadFromDom();
   await updateLoadOlderButton();
   if (firstLoad) {
     scrollMessagesToBottom(room);
@@ -1459,6 +1608,25 @@ function securityEventLabel(type) {
   };
   return labels[type] || 'Security event';
 }
+async function deleteSecurityEvent(eventId, card, button) {
+  if (!isAccountAdmin || typeof eventId !== 'string') return;
+  if (!window.confirm('Delete this security log entry only? This cannot be undone.')) return;
+  button.disabled = true;
+  try {
+    await apiRequest('/api/admin/security-events/delete', {
+      method: 'POST',
+      body: JSON.stringify({ eventId }),
+    });
+    card.remove();
+    if (!$('securityEvents').querySelector('.security-event')) {
+      renderSecurityEvents([]);
+    }
+    $('securityStatus').textContent = 'Security log entry deleted.';
+  } catch (error) {
+    button.disabled = false;
+    $('securityStatus').textContent = error.message || 'Could not delete this security log entry.';
+  }
+}
 function renderSecurityEvents(events) {
   const list = $('securityEvents');
   list.replaceChildren();
@@ -1479,7 +1647,13 @@ function renderSecurityEvents(events) {
     const code = document.createElement('span');
     code.className = 'small';
     code.textContent = `HTTP ${Number(event.status) || '—'}`;
-    header.append(title, code);
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'security-event-delete';
+    remove.textContent = 'Delete';
+    remove.setAttribute('aria-label', 'Delete this security log entry');
+    remove.addEventListener('click', () => deleteSecurityEvent(event.id, card, remove));
+    header.append(title, code, remove);
 
     const details = document.createElement('p');
     details.className = 'small';
@@ -1645,6 +1819,14 @@ $('plain').addEventListener('keydown', (event) => {
   }
 });
 $('refresh').addEventListener('click', async () => { try { await loadMessages(); status('Refreshed.'); } catch (error) { status(error.message); } });
+$('messages').addEventListener('scroll', markCurrentRoomReadFromDom, { passive: true });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !apiToken) return;
+  if (roomCode) {
+    void loadMessages().then(markCurrentRoomReadFromDom).catch(() => {});
+  }
+  void refreshUnreadCounts();
+});
 $('leave').addEventListener('click', () => {
   roomEntryGeneration += 1;
   if (pollTimer) clearInterval(pollTimer);
