@@ -110,8 +110,8 @@
     .security-event-header { display:flex; align-items:center; justify-content:space-between; gap:.75rem; }
     .security-event-header strong { flex:1; }
     .security-event p { margin:.3rem 0 0; }
-    .security-event-delete { width:auto; margin:0; padding:.35rem .6rem; border:1px solid #efb8b8; background:#fff; color:#a11b1b; font-size:.8rem; }
-    .security-event-delete:hover { background:#fff1f1; }
+    .security-event-delete { width:auto; flex:0 0 auto; margin:0; padding:.45rem .7rem; border:1px solid #e2a0a0; border-radius:8px; background:#fff1f1; color:#921b1b; font-size:.8rem; font-weight:700; }
+    .security-event-delete:hover { background:#ffe0e0; }
     dialog { width:min(420px,calc(100% - 2rem)); border:1px solid var(--line); border-radius:15px; padding:1.25rem; color:var(--ink); background:#fff; box-shadow:0 20px 60px #0f172a40; }
     .terms-dialog { width:min(720px,calc(100% - 2rem)); max-height:calc(100% - 2rem); }
     dialog::backdrop { background:#0f172a99; }
@@ -247,7 +247,7 @@
   </dialog>
   <dialog id="securityDialog" class="security-dialog" aria-labelledby="securityDialogTitle">
     <h2 id="securityDialogTitle">Security activity</h2>
-    <p class="small">Recent failed or blocked requests. Raw client IPs and account identifiers are shown when available. Passwords, tokens, and message contents are never shown.</p>
+    <p class="small">Each entry shows request time, method, path, status, raw client IP, and account ID or email when available. Delete one entry at a time with its Delete log button. Passwords, tokens, and message contents are never shown.</p>
     <p class="small">Failed sign-in reports include the email entered in the browser and may be inaccurate. Full Edge Function runtime logs are in Supabase Dashboard → Edge Functions → your function → Logs.</p>
     <p id="securityStatus" class="status" role="status" aria-live="polite"></p>
     <div id="securityEvents" class="security-events" aria-live="polite"></div>
@@ -1650,7 +1650,7 @@ function renderSecurityEvents(events) {
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'security-event-delete';
-    remove.textContent = 'Delete';
+    remove.textContent = 'Delete log';
     remove.setAttribute('aria-label', 'Delete this security log entry');
     remove.addEventListener('click', () => deleteSecurityEvent(event.id, card, remove));
     header.append(title, code, remove);
