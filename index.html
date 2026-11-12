@@ -123,8 +123,20 @@
       .profile-strip input { max-width:none; }
       .profile-strip .small { width:100%; margin:0; }
       #chat { margin:1rem -.1rem 0; }
-      .chat-layout { min-height:calc(100dvh - 130px); border-radius:13px; }
-      #messages { min-height:240px; max-height:none; }
+      .chat-layout {
+        height:calc(100dvh - 130px);
+        min-height:calc(100dvh - 130px);
+        overflow:hidden;
+        border-radius:13px;
+      }
+      .chat-panel { min-height:0; }
+      #messages {
+        flex:1 1 auto;
+        min-height:0;
+        max-height:none;
+        overflow-y:auto;
+        overscroll-behavior:contain;
+      }
       .message { max-width:88%; }
       .chat-header { gap:.6rem; padding:.7rem .75rem; }
       .chat-tools { padding:.45rem .85rem; }
@@ -969,6 +981,17 @@ async function deleteMyMessagesEverywhere() {
     if (apiToken && roomCode) void syncRoomHistory(roomCode).catch(() => {});
   }
 }
+function scrollMessagesToBottom(expectedRoom) {
+  const moveToBottom = () => {
+    if (expectedRoom && roomCode !== expectedRoom) return;
+    const container = $('messages');
+    container.scrollTop = container.scrollHeight;
+  };
+  moveToBottom();
+  requestAnimationFrame(moveToBottom);
+  requestAnimationFrame(() => requestAnimationFrame(moveToBottom));
+}
+
 async function renderMessages(data, options = {}) {
   const container = $('messages');
   if (options.expectedRoom && roomCode !== options.expectedRoom) return 0;
@@ -1023,7 +1046,7 @@ async function renderMessages(data, options = {}) {
     else container.append(row);
     appended += 1;
   }
-  if (options.scrollToBottom === true) container.scrollTop = container.scrollHeight;
+  if (options.scrollToBottom === true) scrollMessagesToBottom(options.expectedRoom);
   else if (prepend && appended) container.scrollTop += container.scrollHeight - oldScrollHeight;
   else if (appended && wasNearBottom) container.scrollTop = container.scrollHeight;
   return appended;
@@ -1059,6 +1082,7 @@ async function loadMessages() {
   messagesInitialized = true;
   await updateLoadOlderButton();
   if (firstLoad) {
+    scrollMessagesToBottom(room);
     void syncRoomHistory(room, { messages, hasMore: pageHasMore }, cachedBeforeLoad).catch(() => {});
   }
   return !firstLoad && hasNewMessages;
@@ -1336,6 +1360,7 @@ async function enterRoom(code, name) {
     showingCachedHistory = true;
     $('historyStatus').textContent = 'Showing encrypted messages saved on this device.';
     await updateLoadOlderButton();
+    scrollMessagesToBottom(roomCode);
     status('Showing encrypted history saved on this device. Reconnect to open the shared chat.');
     return;
   }
@@ -1356,6 +1381,7 @@ async function enterRoom(code, name) {
     showingCachedHistory = true;
     $('historyStatus').textContent = 'Showing encrypted messages saved on this device.';
     await updateLoadOlderButton();
+    scrollMessagesToBottom(roomCode);
     status('Showing encrypted history saved on this device. Reconnect to refresh or send messages.');
   }
 }
