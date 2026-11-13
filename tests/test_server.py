@@ -62,7 +62,7 @@ class ServerApiTests(unittest.TestCase):
         self.auth_user_patch = patch.object(server, "_supabase_auth_user_details", return_value={
             "id": TEST_SENDER_ID,
             "email": "user@example.com",
-            "app_metadata": {},
+            "app_metadata": {"private_chat_invited": True},
         })
         self.supabase.start()
         self.auth_user = self.auth_user_patch.start()
@@ -547,6 +547,43 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(first_sender, TEST_SENDER_ID)
         self.assertEqual(second_sender, TEST_SENDER_ID)
 
+    def test_uninvited_account_cannot_create_a_chat_session(self):
+        self.auth_user.return_value = {
+            "id": TEST_SENDER_ID,
+            "email": "uninvited@example.com",
+            "app_metadata": {},
+        }
+
+        status_code, result = self.request(
+            "/api/auth/session",
+            method="POST",
+            payload={"supabaseAccessToken": TEST_SUPABASE_ACCESS_TOKEN},
+        )
+
+        self.assertEqual(status_code, 403)
+        self.assertIn("has not been invited", result["error"])
+        self.assertEqual(self.security_events[-1]["event_type"], "forbidden_request")
+        self.assertEqual(self.security_events[-1]["account_email"], "uninvited@example.com")
+        self.assertEqual(self.security_events[-1]["account_id"], TEST_SENDER_ID)
+        self.assertFalse(server._sessions)
+
+    def test_existing_room_member_keeps_access_without_invitation_metadata(self):
+        self.auth_user.return_value = {
+            "id": TEST_SENDER_ID,
+            "email": "existing@example.com",
+            "app_metadata": {},
+        }
+        self.members.add(("123456", TEST_SENDER_ID))
+
+        status_code, result = self.request(
+            "/api/auth/session",
+            method="POST",
+            payload={"supabaseAccessToken": TEST_SUPABASE_ACCESS_TOKEN},
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertIsInstance(result["token"], str)
+
     def test_only_allowlisted_email_gets_admin_session(self):
         self.auth_user.return_value = {
             "id": TEST_SENDER_ID,
@@ -779,6 +816,7 @@ class ServerApiTests(unittest.TestCase):
         call = create_user.call_args
         self.assertEqual(call.args[0], "/auth/v1/admin/users")
         self.assertEqual(call.kwargs["body"]["email_confirm"], True)
+        self.assertEqual(call.kwargs["body"]["app_metadata"], {"private_chat_invited": True})
         self.assertEqual(call.kwargs["body"]["user_metadata"], {"display_name": "New friend"})
 
     def test_non_admin_cannot_create_accounts(self):

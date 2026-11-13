@@ -12,9 +12,10 @@ const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const encoder = new TextEncoder();
 
 class ApiError extends Error {
-  constructor(status, message) {
+  constructor(status, message, securityIdentity = null) {
     super(message);
     this.status = status;
+    this.securityIdentity = securityIdentity;
   }
 }
 
@@ -501,6 +502,18 @@ async function supabaseUserFromAccessToken(accessToken) {
   return user;
 }
 
+async function hasExistingChatMembership(senderId) {
+  const memberships = await supabaseRequest("chat_api_room_members", {
+    select: "room_code",
+    sender_id: `eq.${senderId}`,
+    limit: "1",
+  });
+  if (!Array.isArray(memberships)) {
+    throw new ApiError(502, "Chat storage returned an invalid account invitation check.");
+  }
+  return memberships.length > 0;
+}
+
 async function createApiSession(request) {
   const settings = config();
   if (!settings.sessionSecret || !settings.serviceKey) {
@@ -515,6 +528,21 @@ async function createApiSession(request) {
   }
   const user = await supabaseUserFromAccessToken(accessToken);
   const senderId = user.id;
+  const invitedByAdmin = user.app_metadata?.private_chat_invited === true;
+  const accountAdmin = isChatAdmin(user, settings);
+  const existingRoomMember = accountAdmin || invitedByAdmin
+    ? false
+    : await hasExistingChatMembership(senderId);
+  if (!accountAdmin && !invitedByAdmin && !existingRoomMember) {
+    throw new ApiError(
+      403,
+      "This account has not been invited to Private Messages. Ask an administrator for access.",
+      {
+        accountId: senderId,
+        accountEmail: securityEmail(user.email),
+      },
+    );
+  }
   await cleanupExpiredRows();
   const token = encodeBase64Url(randomBytes(32));
   const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
@@ -527,7 +555,7 @@ async function createApiSession(request) {
   return {
     token,
     expiresAt: Math.floor(Date.parse(expiresAt) / 1000),
-    isAdmin: isChatAdmin(user, settings),
+    isAdmin: accountAdmin,
   };
 }
 
@@ -803,6 +831,7 @@ async function createAccount(request) {
         email,
         password,
         email_confirm: true,
+        app_metadata: { private_chat_invited: true },
         user_metadata: { display_name: displayName },
       }),
       cache: "no-store",
@@ -1063,7 +1092,13 @@ async function handle(request) {
     const status = error instanceof ApiError ? error.status : 500;
     const eventType = securityEventType(route, status);
     if (eventType) {
-      await recordSecurityEvent(request, route, eventType, status);
+      await recordSecurityEvent(
+        request,
+        route,
+        eventType,
+        status,
+        error instanceof ApiError ? error.securityIdentity : null,
+      );
     }
     if (error instanceof ApiError) {
       return jsonResponse(request, error.status, { error: error.message });

@@ -90,6 +90,15 @@ GitHub Pages app, sign in, create two rooms, and confirm both appear in the chat
 list. An account administrator can also create a confirmed account through
 **Add account**.
 
+Chat sessions are invite-only. New accounts created through **Add account**
+receive a server-managed `app_metadata.private_chat_invited` marker. Existing
+accounts that already belong to a chat remain eligible, and administrator
+accounts remain eligible. An authenticated Supabase account without one of
+those approvals is blocked from chat sessions and appears in the admin
+security log. For fewer unused Auth accounts, also disable public sign-ups in
+the Supabase Auth settings; the chat API still rejects uninvited accounts if
+public sign-ups are left enabled.
+
 ## 6. Review security activity
 
 After running both security-event migrations and deploying the updated function,

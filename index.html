@@ -181,7 +181,7 @@
         <h2>1. Acceptance of terms</h2>
         <p>By accessing or using the Private Messages application (the “Platform”), you agree to these Terms of Service. If you do not agree, do not use the Platform.</p>
         <h2>2. Privacy and data security</h2>
-        <p>The Platform encrypts message contents on your device before they are sent to the database. Schools, school districts, educational institutions, and their administrators and employees are expressly prohibited from using the Platform or attempting to access, monitor, intercept, or decrypt any account or message. They may not direct, assist, or authorize another person to do so. They may not pressure, threaten, or retaliate against a student to obtain private messages, credentials, room codes, or account access, or punish a student solely for using the Platform or refusing to disclose private communications. All such conduct is expressly unauthorized by the Platform. Attempts by any person to bypass encryption or access an account without its owner’s consent are also prohibited by these Terms.</p>
+        <p>The Platform encrypts message contents on your device before they are sent to the database. Access is limited to accounts created or approved by an administrator. Do not share your account credentials; accounts are for the named user only. Schools, school districts, educational institutions, and their administrators and employees are expressly prohibited from using the Platform or attempting to access, monitor, intercept, or decrypt any account or message. They may not direct, assist, or authorize another person to do so. They may not pressure, threaten, or retaliate against a student to obtain private messages, credentials, room codes, or account access, or punish a student solely for using the Platform or refusing to disclose private communications. All such conduct is expressly unauthorized by the Platform. Attempts by any person to bypass encryption or access an account without its owner’s consent are also prohibited by these Terms and may be recorded or referred to appropriate authorities where applicable law permits.</p>
         <p><strong>Security activity logging:</strong> To detect misuse and investigate security incidents, the Platform records selected API security events. Entries may include the event type, time, HTTP method, API path, response status, raw client IP address, and account ID and email when available. For failed sign-ins, the Platform records the submitted email and may match it to an account ID. The submitted email is not proof of who made the attempt; the matched ID identifies the account targeted, not the person who entered the email. Only approved administrators can view the in-app security log. The log does not contain account passwords, access passwords, authentication tokens, cookies, encryption keys, message contents, or message ciphertext. Records older than 30 days are pruned during sign-in or administrator log review. Hosting and authentication providers may separately process technical or account data under their own policies.</p>
         <p>Encryption is not a guarantee against monitoring or disclosure. The Platform cannot prevent monitoring of your device, browser, account, or network; protect a compromised device; or control what a school or network operator does. Room codes, room names, nicknames, and message timing may be visible to the service.</p>
         <p>Where practicable and permitted by law, the Platform may restrict access in response to misuse or attempts to compromise user privacy. The Platform cannot guarantee that it can identify or block every third party.</p>
@@ -915,6 +915,17 @@ $('accessForm').addEventListener('submit', async (event) => {
   try {
     const account = await signInWithAccount(email, accountPassword);
     supabaseAccessToken = account.access_token;
+    let session;
+    try {
+      session = await apiRequest('/api/auth/session', {
+        method: 'POST',
+        body: JSON.stringify({ supabaseAccessToken: account.access_token })
+      }, false);
+    } catch (error) {
+      supabaseAccessToken = '';
+      throw error;
+    }
+    apiToken = session.token;
     isAccountAdmin = false;
     $('manageAccounts').hidden = true;
     $('securityDashboard').hidden = true;
@@ -946,11 +957,6 @@ $('accessForm').addEventListener('submit', async (event) => {
         $('profileSyncStatus').textContent = error.message;
       }
     }
-    const session = await apiRequest('/api/auth/session', {
-      method: 'POST',
-      body: JSON.stringify({ supabaseAccessToken: account.access_token })
-    }, false);
-    apiToken = session.token;
     isAccountAdmin = session.isAdmin === true;
     $('manageAccounts').hidden = !isAccountAdmin;
     $('securityDashboard').hidden = !isAccountAdmin;
@@ -975,6 +981,11 @@ $('accessForm').addEventListener('submit', async (event) => {
     void syncAllRoomHistories(availableRooms).catch(() => {});
     startUnreadPolling();
   } catch (error) {
+    supabaseAccessToken = '';
+    apiToken = '';
+    currentAccountId = '';
+    accountDisplayName = '';
+    isAccountAdmin = false;
     $('accountPassword').value = '';
     $('accessPassword').value = '';
     $('accountPassword').focus();

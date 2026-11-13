@@ -54,9 +54,10 @@ _room_join_failures = {}
 
 
 class ApiError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, security_identity=None):
         super().__init__(message)
         self.status = status
+        self.security_identity = security_identity
 
 
 def _allowed_origins():
@@ -159,6 +160,22 @@ def _is_chat_admin(user):
         if value.strip()
     }
     return email.strip().lower() in allowed
+
+
+def _is_chat_invited(user):
+    metadata = user.get("app_metadata") if isinstance(user, dict) else None
+    return isinstance(metadata, dict) and metadata.get("private_chat_invited") is True
+
+
+def _has_chat_room_membership(sender_id):
+    memberships = _supabase_request("/rest/v1/chat_api_room_members", query={
+        "select": "room_code",
+        "sender_id": f"eq.{sender_id}",
+        "limit": "1",
+    })
+    if not isinstance(memberships, list):
+        raise ApiError(502, "Chat storage returned an invalid account invitation check.")
+    return bool(memberships)
 
 
 def _security_event_type(path, status):
@@ -353,7 +370,7 @@ class SiteHandler(BaseHTTPRequestHandler):
             "account_email": session.get("sender_email"),
         }
 
-    def _record_security_failure(self, path, status):
+    def _record_security_failure(self, path, status, identity=None):
         event_type = _security_event_type(path, status)
         if not event_type:
             return
@@ -364,7 +381,7 @@ class SiteHandler(BaseHTTPRequestHandler):
                     event_type,
                     path,
                     status,
-                    self._security_account_identity(),
+                    identity or self._security_account_identity(),
                 )
         except Exception:
             print("[chat-api] Security event could not be recorded.", flush=True)
@@ -446,7 +463,7 @@ class SiteHandler(BaseHTTPRequestHandler):
                 return
             raise ApiError(404, "Not found.")
         except ApiError as error:
-            self._record_security_failure(path, error.status)
+            self._record_security_failure(path, error.status, error.security_identity)
             self._send_json(error.status, {"error": str(error)})
 
     def _serve_file(self, path, head_only=False):
@@ -482,6 +499,19 @@ class SiteHandler(BaseHTTPRequestHandler):
         user = _supabase_auth_user_details(access_token)
         sender_id = user["id"]
         is_admin = _is_chat_admin(user)
+        is_invited = _is_chat_invited(user)
+        has_membership = (
+            False if is_admin or is_invited else _has_chat_room_membership(sender_id)
+        )
+        if not is_admin and not is_invited and not has_membership:
+            raise ApiError(
+                403,
+                "This account has not been invited to Private Messages. Ask an administrator for access.",
+                {
+                    "account_id": sender_id,
+                    "account_email": _security_email(user.get("email")),
+                },
+            )
         try:
             _cleanup_security_data()
         except Exception:
@@ -671,6 +701,7 @@ class SiteHandler(BaseHTTPRequestHandler):
             "email": email,
             "password": password,
             "email_confirm": True,
+            "app_metadata": {"private_chat_invited": True},
             "user_metadata": {"display_name": display_name.strip()},
         })
         if not isinstance(created, dict) or not created.get("id"):
